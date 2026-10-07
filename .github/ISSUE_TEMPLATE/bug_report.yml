@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work the way it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Search for ...
+        2. Click ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tubefast version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+  - type: dropdown
+    id: signed-in
+    attributes:
+      label: Were you signed in?
+      options: ["No", "Yes, through the browser window", "Yes, with a pasted cookie"]
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Output of `tubefast --selftest`
+      description: Only needed when search or playback is involved. Run it from a terminal.
+      render: text
