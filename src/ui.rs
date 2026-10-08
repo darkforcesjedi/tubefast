@@ -1,16 +1,17 @@
 use crate::APP_NAME;
-use crate::app::{Action, App, Covers, Load, Repeat, Route};
+use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
 use crate::art::Art;
 use crate::ytm::{Item, Layout};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
 use eframe::egui::style::ScrollStyle;
-use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
+use eframe::egui::text::{CCursor, LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
     self, Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Frame, Galley, Id, Key, Margin, Pos2, Rect, Response,
     RichText, Sense, Shape, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, pos2, vec2,
 };
 use egui_phosphor::regular as icon;
+use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -22,12 +23,14 @@ const MUTED: Color32 = Color32::from_rgba_premultiplied(166, 166, 166, 166);
 const FAINT: Color32 = Color32::from_rgba_premultiplied(122, 122, 122, 122);
 const ACCENT: Color32 = rgb(0xF4623F);
 const ON_ACCENT: Color32 = rgb(0x1A0A05);
+const FLOATING: Color32 = rgb(0x1B1C21);
 
 const SIDEBAR_WIDTH: f32 = 244.0;
 const QUEUE_WIDTH: f32 = 336.0;
 const QUEUE_MIN_WINDOW: f32 = 1140.0;
 const BAR_HEIGHT: f32 = 84.0;
 const ACCOUNT_HEIGHT: f32 = 68.0;
+const UPDATE_HEIGHT: f32 = 50.0;
 const TOPBAR_HEIGHT: f32 = 68.0;
 const AMBIENT_HEIGHT: f32 = 380.0;
 const HERO_ART: f32 = 216.0;
@@ -43,6 +46,11 @@ const COMPACT_ROWS: usize = 3;
 const PAGE_MARGIN: i8 = 32;
 const HOVER_TIME: f32 = 0.1;
 const MENU_WIDTH: f32 = 248.0;
+const QUEUE_ROW: f32 = 52.0;
+const STICKY_HEIGHT: f32 = 60.0;
+const STAGE_ART: f32 = 512.0;
+const STAGE_LUMINANCE: f32 = 0.14;
+const PAGE_FADE: f64 = 0.12;
 
 const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
@@ -172,7 +180,7 @@ pub fn install(ctx: &egui::Context) {
         let visuals = &mut style.visuals;
         *visuals = egui::Visuals::dark();
         visuals.panel_fill = BASE;
-        visuals.window_fill = rgb(0x1B1C21);
+        visuals.window_fill = FLOATING;
         visuals.extreme_bg_color = PANEL;
         visuals.override_text_color = Some(TEXT);
         visuals.window_stroke = Stroke::new(1.0, veil(0.08));
@@ -295,6 +303,56 @@ struct Scrub {
     played: f32,
     buffered: f32,
     hover: f32,
+    aim: Option<(f32, u64)>,
+}
+
+#[cfg(windows)]
+pub struct TitleBar {
+    window: isize,
+    painted: Option<Color32>,
+}
+
+#[cfg(windows)]
+impl TitleBar {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let window = match cc.window_handle().map(|handle| handle.as_raw()) {
+            Ok(RawWindowHandle::Win32(window)) => window.hwnd.get(),
+            _ => 0,
+        };
+        Self { window, painted: None }
+    }
+
+    fn paint(&mut self, color: Color32) {
+        use windows_sys::Win32::Graphics::Dwm::{
+            DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+        };
+        if self.window == 0 || self.painted == Some(color) {
+            return;
+        }
+        self.painted = Some(color);
+        let packed = |color: Color32| color.r() as u32 | (color.g() as u32) << 8 | (color.b() as u32) << 16;
+        let attributes = [
+            (DWMWA_USE_IMMERSIVE_DARK_MODE, 1),
+            (DWMWA_CAPTION_COLOR, packed(color)),
+            (DWMWA_TEXT_COLOR, packed(TEXT)),
+        ];
+        for (attribute, value) in attributes {
+            unsafe { DwmSetWindowAttribute(self.window as _, attribute as u32, (&raw const value).cast(), 4) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub struct TitleBar;
+
+#[cfg(not(windows))]
+impl TitleBar {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self
+    }
+
+    fn paint(&mut self, _color: Color32) {}
 }
 
 pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
@@ -306,25 +364,34 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
         .frame(plain(PANEL))
         .show(ctx, |ui| player_bar(app, ui, &mut out))
         .inner;
-    egui::SidePanel::left("sidebar")
-        .exact_width(SIDEBAR_WIDTH)
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(plain(PANEL))
-        .show(ctx, |ui| sidebar(app, ui, &mut out));
-    let queue_fits = app.saved.queue_open && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
-    egui::SidePanel::right("queue")
-        .exact_width(QUEUE_WIDTH)
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(plain(PANEL))
-        .show_animated(ctx, queue_fits, |ui| queue_panel(app, ui, &mut out));
-    egui::CentralPanel::default()
-        .frame(plain(BASE))
-        .show(ctx, |ui| content(app, ui, &mut out));
-    paint_scrubber(&ctx.layer_painter(egui::LayerId::background()), &scrub);
+    let mut frame = PANEL;
+    if app.expanded && app.now_playing().is_some() {
+        frame = egui::CentralPanel::default()
+            .frame(plain(PANEL))
+            .show(ctx, |ui| now_playing(app, ui, &mut out))
+            .inner;
+    } else {
+        egui::SidePanel::left("sidebar")
+            .exact_width(SIDEBAR_WIDTH)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(plain(PANEL))
+            .show(ctx, |ui| sidebar(app, ui, &mut out));
+        let queue_fits = app.saved.queue_open && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
+        egui::SidePanel::right("queue")
+            .exact_width(QUEUE_WIDTH)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(plain(PANEL))
+            .show_animated(ctx, queue_fits, |ui| queue_panel(app, ui, &mut out));
+        egui::CentralPanel::default()
+            .frame(plain(BASE))
+            .show(ctx, |ui| content(app, ui, &mut out));
+    }
+    app.title_bar.paint(frame);
+    paint_scrubber(ctx, &scrub);
     sign_in_dialog(app, ctx, &mut out);
-    notice(app, ctx);
+    notice(app, ctx, &mut out);
     out
 }
 
@@ -343,6 +410,59 @@ fn label(ui: &Ui, at: Pos2, anchor: Align2, text: &str, font: FontId, color: Col
     let galley = fit(ui, text, font, color, width, 1);
     let rect = anchor.anchor_size(at, galley.size());
     ui.painter().galley(rect.min, galley, color);
+    rect
+}
+
+fn artist_spans(item: &Item) -> Vec<(Range<usize>, &str)> {
+    let subtitle = item.subtitle.as_str();
+    if item.artists.is_empty() && !item.artist_id.is_empty() {
+        return vec![(0..subtitle.chars().count(), &item.artist_id)];
+    }
+    let mut searched = 0;
+    let mut spans = Vec::new();
+    for (name, browse_id) in &item.artists {
+        let later = subtitle[searched..].find(name.as_str()).map(|at| searched + at);
+        let Some(start) = later.or_else(|| subtitle.find(name.as_str())) else {
+            continue;
+        };
+        searched = start + name.len();
+        let first = subtitle[..start].chars().count();
+        spans.push((first..first + name.chars().count(), browse_id.as_str()));
+    }
+    spans
+}
+
+fn artist_links(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, origin: Pos2, galley: &Arc<Galley>) {
+    if item.is_artist {
+        return;
+    }
+    for (index, (chars, browse_id)) in artist_spans(item).into_iter().enumerate() {
+        let edge = |at: usize| galley.pos_from_cursor(CCursor::new(at));
+        let rect = Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2());
+        if rect.width() < 1.0 {
+            continue;
+        }
+        let response = ui.interact(rect, id.with(index), Sense::click());
+        let hover = hover_of(ui, &response);
+        if hover > 0.0 {
+            ui.painter()
+                .with_clip_rect(rect)
+                .galley_with_override_text_color(origin, galley.clone(), MUTED.lerp_to_gamma(TEXT, hover));
+            let line = Stroke::new(1.0, TEXT.gamma_multiply(hover));
+            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, line);
+        }
+        describe(&response, "Go to artist");
+        if response.clicked() {
+            out.push(Action::Go(Route::Browse(browse_id.to_owned())));
+        }
+    }
+}
+
+fn byline(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, at: Pos2, font: FontId, width: f32) -> Rect {
+    let galley = fit(ui, &item.subtitle, font, MUTED, width, 1);
+    let rect = Align2::LEFT_CENTER.anchor_size(at, galley.size());
+    ui.painter().galley(rect.min, galley.clone(), MUTED);
+    artist_links(ui, out, item, id, rect.min, &galley);
     rect
 }
 
@@ -374,6 +494,13 @@ fn hover_of(ui: &Ui, response: &Response) -> f32 {
 
 fn describe(response: &Response, name: &str) {
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, name));
+    point_at(response);
+}
+
+fn point_at(response: &Response) {
+    if response.hovered() {
+        response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
 }
 
 fn icon_button(ui: &Ui, rect: Rect, id: Id, symbol: &str, font: FontId, color: Color32, hint: &str) -> Response {
@@ -390,6 +517,20 @@ fn icon_button(ui: &Ui, rect: Rect, id: Id, symbol: &str, font: FontId, color: C
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, symbol, font, tone);
     describe(&response, hint);
     response.on_hover_text(hint)
+}
+
+fn text_button(ui: &Ui, right_center: Pos2, id: Id, text: &str) -> Response {
+    let galley = fit(ui, text, medium(13.0), MUTED, 120.0, 1);
+    let slot = Align2::RIGHT_CENTER
+        .anchor_size(right_center, galley.size())
+        .expand2(vec2(10.0, 6.0));
+    let response = ui.interact(slot, id, Sense::click());
+    let hover = hover_of(ui, &response);
+    ui.painter().rect_filled(slot, 14.0, veil(0.07 * hover));
+    ui.painter()
+        .galley_with_override_text_color(slot.shrink2(vec2(10.0, 6.0)).min, galley, MUTED.lerp_to_gamma(TEXT, hover));
+    describe(&response, text);
+    response
 }
 
 fn pill(ui: &Ui, at: Pos2, id: Id, symbol: &str, text: &str, primary: bool) -> Response {
@@ -441,7 +582,7 @@ fn bars(ui: &Ui, center: Pos2, moving: bool) {
             .rect_filled(Rect::from_min_max(pos2(x - 1.5, top), pos2(x + 1.5, center.y + 7.0)), 1.0, ACCENT);
     }
     if moving && ui.input(|input| input.focused) {
-        ui.ctx().request_repaint_after(Duration::from_millis(90));
+        ui.ctx().request_repaint();
     }
 }
 
@@ -645,15 +786,8 @@ fn track_row(ui: &mut Ui, cx: &mut Cx, items: &[Item], index: usize, number: Opt
         title,
         right - left,
     );
-    label(
-        ui,
-        pos2(left, mid + 10.0),
-        Align2::LEFT_CENTER,
-        &item.subtitle,
-        sans(13.0),
-        MUTED,
-        right - left,
-    );
+    let artist = response.id.with("artist");
+    byline(ui, cx.out, item, artist, pos2(left, mid + 10.0), sans(13.0), right - left);
 
     describe(&response, &item.title);
     if response.clicked() {
@@ -698,15 +832,8 @@ fn card(ui: &Ui, cx: &mut Cx, items: &[Item], index: usize, cell: Rect, id: Id) 
         title,
         cell.width(),
     );
-    label(
-        ui,
-        pos2(cell.left(), art.bottom() + 42.0),
-        Align2::LEFT_CENTER,
-        &item.subtitle,
-        sans(13.0),
-        MUTED,
-        cell.width(),
-    );
+    let below = pos2(cell.left(), art.bottom() + 42.0);
+    byline(ui, cx.out, item, id.with("artist"), below, sans(13.0), cell.width());
     describe(&response, &item.title);
     if response.clicked() {
         cx.activate(items, index);
@@ -741,15 +868,8 @@ fn compact(ui: &Ui, cx: &mut Cx, items: &[Item], index: usize, cell: Rect, id: I
         title,
         width,
     );
-    label(
-        ui,
-        pos2(left, cell.center().y + 10.0),
-        Align2::LEFT_CENTER,
-        &item.subtitle,
-        sans(13.0),
-        MUTED,
-        width,
-    );
+    let below = pos2(left, cell.center().y + 10.0);
+    byline(ui, cx.out, item, id.with("artist"), below, sans(13.0), width);
     describe(&response, &item.title);
     if response.clicked() {
         cx.activate(items, index);
@@ -794,17 +914,7 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[
         label(ui, row.left_center(), Align2::LEFT_CENTER, title, bold(20.0), TEXT, width - 120.0);
         if foldable {
             let text = if open { "Show less" } else { "Show all" };
-            let galley = fit(ui, text, medium(13.0), MUTED, 120.0, 1);
-            let slot = Align2::RIGHT_CENTER
-                .anchor_size(row.right_center(), galley.size())
-                .expand2(vec2(10.0, 6.0));
-            let response = ui.interact(slot, id.with("fold"), Sense::click());
-            let hover = hover_of(ui, &response);
-            ui.painter().rect_filled(slot, 14.0, veil(0.07 * hover));
-            ui.painter()
-                .galley_with_override_text_color(slot.shrink2(vec2(10.0, 6.0)).min, galley, MUTED.lerp_to_gamma(TEXT, hover));
-            describe(&response, text);
-            if response.clicked() {
+            if text_button(ui, row.right_center(), id.with("fold"), text).clicked() {
                 open = !open;
                 ui.data_mut(|data| data.insert_temp(id, open));
             }
@@ -857,15 +967,8 @@ fn top_result(ui: &mut Ui, cx: &mut Cx, items: &[Item], id: Id) {
         TEXT,
         width,
     );
-    label(
-        ui,
-        pos2(left, rect.center().y + 20.0),
-        Align2::LEFT_CENTER,
-        &item.subtitle,
-        sans(14.0),
-        MUTED,
-        width,
-    );
+    let below = pos2(left, rect.center().y + 20.0);
+    byline(ui, cx.out, item, id.with("artist"), below, sans(14.0), width);
     let (symbol, text) = if item.is_song() {
         (icon::PLAY, "Play")
     } else {
@@ -999,7 +1102,7 @@ fn message(ui: &mut Ui, symbol: &str, title: &str, hint: &str) -> Rect {
     rect
 }
 
-fn local(ui: &mut Ui, cx: &mut Cx, title: &str, symbol: &str, items: &[Item], empty: [&str; 2]) {
+fn local(ui: &mut Ui, cx: &mut Cx, title: &str, symbol: &str, items: &[Item], empty: [&str; 2], clearable: bool) {
     let count = if items.len() == 1 {
         "1 song".to_owned()
     } else {
@@ -1010,8 +1113,12 @@ fn local(ui: &mut Ui, cx: &mut Cx, title: &str, symbol: &str, items: &[Item], em
         subtitle: count,
         ..Item::default()
     };
+    let play_row_end = pos2(ui.max_rect().right(), ui.cursor().top() + HERO_ART - 21.0);
     if hero(ui, cx, &header, Some(symbol), !items.is_empty(), None) {
         cx.out.push(Action::Play(items.to_vec(), 0));
+    }
+    if clearable && !items.is_empty() && text_button(ui, play_row_end, ui.id().with("clear"), "Clear history").clicked() {
+        cx.out.push(Action::ClearHistory);
     }
     ui.add_space(28.0);
     if items.is_empty() {
@@ -1077,27 +1184,87 @@ fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: O
     }
 }
 
-fn ambient(ui: &Ui, area: Rect, tint: Option<Color32>) {
-    let target = tint.map_or(BASE, |tint| {
+fn mood(ui: &Ui, name: &str, tint: Option<Color32>, floor: Color32, brightness: f32) -> Color32 {
+    let target = tint.map_or(floor, |tint| {
         let mut color = Hsva::from(tint);
         color.s = (color.s * 1.5).min(0.8);
-        color.v = 0.36;
-        BASE.lerp_to_gamma(Color32::from(color), 0.8)
+        color.v = brightness;
+        floor.lerp_to_gamma(Color32::from(color), 0.8)
     });
-    let channel = |index: usize, value: u8| ui.ctx().animate_value_with_time(Id::new(("ambient", index)), value as f32, 0.6) as u8;
-    let top = Color32::from_rgb(channel(0, target.r()), channel(1, target.g()), channel(2, target.b()));
-    if top == BASE {
+    let channel = |index: usize, value: u8| ui.ctx().animate_value_with_time(Id::new((name, index)), value as f32, 0.6) as u8;
+    Color32::from_rgb(channel(0, target.r()), channel(1, target.g()), channel(2, target.b()))
+}
+
+fn luminance(color: Color32) -> f32 {
+    let linear = egui::Rgba::from(color);
+    0.2126 * linear.r() + 0.7152 * linear.g() + 0.0722 * linear.b()
+}
+
+fn dimmed(color: Color32, limit: f32) -> Color32 {
+    let scale = limit / luminance(color);
+    if scale >= 1.0 {
+        return color;
+    }
+    let linear = egui::Rgba::from(color);
+    Color32::from(egui::Rgba::from_rgb(linear.r() * scale, linear.g() * scale, linear.b() * scale))
+}
+
+fn wash(painter: &egui::Painter, rect: Rect, top: Color32, bottom: Color32) {
+    if top == bottom {
         return;
     }
-    let rect = Rect::from_min_size(area.min, vec2(area.width(), AMBIENT_HEIGHT.min(area.height())));
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(rect.left_top(), top);
     mesh.colored_vertex(rect.right_top(), top);
-    mesh.colored_vertex(rect.left_bottom(), BASE);
-    mesh.colored_vertex(rect.right_bottom(), BASE);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(1, 2, 3);
-    ui.painter().add(Shape::mesh(mesh));
+    painter.add(Shape::mesh(mesh));
+}
+
+fn entrance(ui: &Ui, scene: Id) -> f32 {
+    let now = ui.input(|input| input.time);
+    let started = ui.data_mut(|data| {
+        let shown = data.get_temp_mut_or_insert_with(Id::new("entrance"), || (scene, f64::NEG_INFINITY));
+        if shown.0 != scene {
+            *shown = (scene, now);
+        }
+        shown.1
+    });
+    let progress = ((now - started) / PAGE_FADE).min(1.0) as f32;
+    if progress < 1.0 {
+        ui.ctx().request_repaint();
+    }
+    progress * (2.0 - progress)
+}
+
+fn sticky(ui: &Ui, strip: Rect, title: &str, playable: bool) -> bool {
+    ui.interact(strip, Id::new("sticky"), Sense::click());
+    let mid = strip.bottom() - STICKY_HEIGHT / 2.0;
+    let mut left = strip.left() + PAGE_MARGIN as f32;
+    let mut clicked = false;
+    if playable {
+        let slot = Rect::from_center_size(pos2(left + 20.0, mid), Vec2::splat(40.0));
+        let play = ui.interact(slot, Id::new("sticky-play"), Sense::click());
+        let hover = hover_of(ui, &play);
+        let pressed = if play.is_pointer_button_down_on() { 1.0 } else { 0.0 };
+        ui.painter().circle_filled(
+            slot.center(),
+            19.0 + hover - pressed,
+            ACCENT.lerp_to_gamma(Color32::WHITE, 0.12 * hover),
+        );
+        ui.painter()
+            .text(slot.center(), Align2::CENTER_CENTER, icon::PLAY, solid(17.0), ON_ACCENT);
+        describe(&play, "Play");
+        clicked = play.clicked();
+        left = slot.right() + 16.0;
+    }
+    let width = strip.right() - left - PAGE_MARGIN as f32;
+    label(ui, pos2(left, mid), Align2::LEFT_CENTER, title, bold(18.0), TEXT, width);
+    ui.painter()
+        .hline(strip.x_range(), strip.bottom() - 0.5, Stroke::new(1.0, veil(0.07)));
+    clicked
 }
 
 fn topbar(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
@@ -1196,17 +1363,30 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
     let playing = app.now_playing().map(|item| (app.saved.covers.of(item), BAR_ART));
     let picture = |source: Option<(&str, f32)>| source.and_then(|(thumb, size)| app.art.get(ui.ctx(), thumb, size));
     let tint = picture(header).or_else(|| picture(playing)).map(|picture| picture.tint);
-    ambient(ui, area, tint);
+    let glow = mood(ui, "ambient", tint, BASE, 0.36);
+    let haze = Rect::from_min_size(area.min, vec2(area.width(), AMBIENT_HEIGHT.min(area.height())));
+    wash(ui.painter(), haze, glow, BASE);
     topbar(app, ui, out);
 
+    let loading = matches!(app.pages.get(&route), Some(Load::Loading));
+    let shown = entrance(ui, Id::new((&route, loading)));
+    let headline = match (&route, app.pages.get(&route)) {
+        (Route::Liked, _) => Some(("Liked songs", !app.saved.liked.is_empty())),
+        (Route::Recent, _) => Some(("Recently played", !app.saved.recent.is_empty())),
+        (Route::Browse(_), Some(Load::Ready(page))) => page.header.as_ref().map(|header| {
+            let playable = page.sections.iter().flat_map(|section| &section.items).any(Item::is_song);
+            (header.title.as_str(), playable)
+        }),
+        _ => None,
+    };
     let mut cx = Cx {
         art: &app.art,
         covers: &app.saved.covers,
         playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
         paused: app.player.paused(),
         liked: &app.saved.liked,
-        single: matches!(route, Route::Search(_)),
-        out,
+        single: matches!(route, Route::Search(_) | Route::Home),
+        out: &mut *out,
     };
     let margin = Margin {
         left: PAGE_MARGIN,
@@ -1214,13 +1394,14 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         top: 8,
         bottom: 56,
     };
-    egui::ScrollArea::vertical().id_salt(&route).auto_shrink(false).show(ui, |ui| {
+    let scrolled = egui::ScrollArea::vertical().id_salt(&route).auto_shrink(false).show(ui, |ui| {
         Frame::new().inner_margin(margin).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.set_opacity(shown);
             match &route {
                 Route::Liked => {
                     let empty = ["No liked songs yet", "Tap the heart on any track to keep it here."];
-                    local(ui, &mut cx, "Liked songs", icon::HEART, &app.saved.liked, empty);
+                    local(ui, &mut cx, "Liked songs", icon::HEART, &app.saved.liked, empty, false);
                 }
                 Route::Recent => {
                     let empty = ["Nothing played yet", "Tracks you listen to are remembered here."];
@@ -1231,23 +1412,41 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
                         icon::CLOCK_COUNTER_CLOCKWISE,
                         &app.saved.recent,
                         empty,
+                        true,
                     );
                 }
                 Route::Search(query) => page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, Some(query)),
-                Route::Home => {
-                    if !app.saved.recent.is_empty() {
-                        let id = ui.id().with("recent");
-                        cx.single = true;
-                        section_view(ui, &mut cx, "Jump back in", Layout::Cards, &app.saved.recent, id, false);
-                        cx.single = false;
-                        ui.add_space(26.0);
-                    }
-                    page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, None);
-                }
-                Route::Browse(_) => page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, None),
+                Route::Home | Route::Browse(_) => page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, None),
             }
         });
     });
+
+    let past_hero = scrolled.state.offset.y > HERO_ART - 36.0;
+    let stuck = ui
+        .ctx()
+        .animate_bool_with_time(Id::new("sticky"), headline.is_some() && past_hero, 0.16);
+    let Some((title, playable)) = headline.filter(|_| stuck > 0.0) else {
+        return;
+    };
+    let overlap = ui.visuals().clip_rect_margin;
+    let strip = Rect::from_min_size(
+        pos2(area.left(), area.top() + TOPBAR_HEIGHT - overlap),
+        vec2(area.width(), STICKY_HEIGHT + overlap),
+    );
+    let mut pane = ui.new_child(UiBuilder::new().id_salt("sticky").max_rect(strip));
+    pane.set_clip_rect(strip);
+    pane.set_opacity(stuck);
+    pane.painter().rect_filled(strip, 0.0, BASE);
+    wash(pane.painter(), haze, glow, BASE);
+    if sticky(&pane, strip, title, playable) {
+        let songs = match (&route, app.pages.get(&route)) {
+            (Route::Liked, _) => app.saved.liked.clone(),
+            (Route::Recent, _) => app.saved.recent.clone(),
+            (_, Some(Load::Ready(page))) => page.songs(),
+            _ => Vec::new(),
+        };
+        out.push(Action::Play(songs, 0));
+    }
 }
 
 fn nav_item(ui: &mut Ui, symbol: &str, text: &str, active: bool, trailing: &str) -> Response {
@@ -1322,6 +1521,9 @@ fn sidebar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     eyebrow(ui, "Library", 26.0);
     let foot = Rect::from_min_max(pos2(area.left(), area.bottom() - ACCOUNT_HEIGHT), area.max);
     account(app, ui, foot, out);
+    let lift = if app.update.is_some() { UPDATE_HEIGHT } else { 0.0 };
+    let offer = Rect::from_min_max(pos2(area.left(), foot.top() - lift), foot.right_top());
+    update_offer(app, ui, offer, out);
     let pinned = &app.saved.pinned;
     let own = app
         .library
@@ -1334,7 +1536,7 @@ fn sidebar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
         });
         return;
     }
-    let height = (foot.top() - ui.cursor().top()).max(0.0);
+    let height = (offer.top() - ui.cursor().top()).max(0.0);
     egui::ScrollArea::vertical().max_height(height).auto_shrink(false).show(ui, |ui| {
         for item in entries {
             let (slot, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
@@ -1372,6 +1574,42 @@ fn sidebar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
         }
         ui.add_space(12.0);
     });
+}
+
+fn update_offer(app: &App, ui: &Ui, slot: Rect, out: &mut Vec<Action>) {
+    let Some(version) = &app.update else { return };
+    let row = slot.shrink2(vec2(12.0, 4.0));
+    let response = ui.interact(row, Id::new("update-offer"), Sense::click());
+    let hover = hover_of(ui, &response);
+    ui.painter()
+        .rect_filled(row, ROW_RADIUS, ACCENT.gamma_multiply(0.14 + 0.08 * hover));
+    let mark = pos2(row.left() + 24.0, row.center().y);
+    if app.updating {
+        egui::Spinner::new()
+            .color(ACCENT)
+            .paint_at(ui, Rect::from_center_size(mark, Vec2::splat(16.0)));
+    } else {
+        ui.painter()
+            .text(mark, Align2::CENTER_CENTER, icon::ARROW_CIRCLE_UP, solid(19.0), ACCENT);
+    }
+    let text = if app.updating {
+        "Updating".to_owned()
+    } else {
+        format!("Update to {version}")
+    };
+    label(
+        ui,
+        pos2(row.left() + 48.0, row.center().y),
+        Align2::LEFT_CENTER,
+        &text,
+        medium(13.5),
+        TEXT,
+        row.width() - 60.0,
+    );
+    describe(&response, &text);
+    if response.clicked() {
+        out.push(Action::GetUpdate);
+    }
 }
 
 fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
@@ -1528,13 +1766,7 @@ fn sign_in_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
                 ui.painter().galley(row.min + vec2(indent, 0.0), status, TEXT);
             }
             ui.add_space(20.0);
-            paragraph(
-                ui,
-                "The session stays on this computer, encrypted with your Windows account.",
-                sans(12.0),
-                FAINT,
-                2,
-            );
+            paragraph(ui, crate::auth::SESSION_KEPT, sans(12.0), FAINT, 2);
             closed
         });
     if modal.inner || modal.should_close() {
@@ -1557,72 +1789,318 @@ fn queue_panel(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
                 );
                 return;
             };
-            let (art, _) = ui.allocate_exact_size(Vec2::splat(ui.available_width()), Sense::hover());
+            let (art, cover) = ui.allocate_exact_size(Vec2::splat(ui.available_width()), Sense::click());
             artwork(ui, &app.art, app.saved.covers.of(item), art, 12.0);
+            let lift = hover_of(ui, &cover);
+            ui.painter().rect_filled(art, 12.0, shade(0.4 * lift));
+            ui.painter().text(
+                art.center(),
+                Align2::CENTER_CENTER,
+                icon::ARROWS_OUT_SIMPLE,
+                glyph(30.0),
+                TEXT.gamma_multiply(lift),
+            );
+            describe(&cover, "Now playing");
+            if cover.clicked() {
+                out.push(Action::Expand(true));
+            }
             ui.add_space(18.0);
             paragraph(ui, &item.title, bold(18.0), TEXT, 2);
             ui.add_space(4.0);
-            paragraph(ui, &item.subtitle, sans(13.5), MUTED, 1);
+            let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+            let artist = Id::new("queue-artist");
+            byline(ui, out, item, artist, line.left_center(), sans(13.5), line.width());
             ui.add_space(22.0);
-
-            let upcoming = app.current.map_or(0, |current| current + 1);
-            if upcoming >= app.queue.len() {
-                return;
-            }
-            eyebrow(ui, "Next up", 0.0);
-            for (index, item) in app.queue.iter().enumerate().skip(upcoming) {
-                let (slot, response) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
-                if !ui.is_rect_visible(slot) {
-                    continue;
-                }
-                let rect = slot.expand2(vec2(8.0, 0.0));
-                let hover = hover_of(ui, &response);
-                ui.painter().rect_filled(rect, ROW_RADIUS, veil(0.06 * hover));
-                let art = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
-                artwork(ui, &app.art, app.saved.covers.of(item), art, 5.0);
-                let (left, width) = (art.right() + 12.0, slot.right() - art.right() - 44.0);
-                label(
-                    ui,
-                    pos2(left, slot.center().y - 9.0),
-                    Align2::LEFT_CENTER,
-                    &item.title,
-                    medium(13.5),
-                    TEXT,
-                    width,
-                );
-                label(
-                    ui,
-                    pos2(left, slot.center().y + 9.0),
-                    Align2::LEFT_CENTER,
-                    &item.subtitle,
-                    sans(12.5),
-                    MUTED,
-                    width,
-                );
-                describe(&response, &item.title);
-                if hover > 0.0 {
-                    let close = Rect::from_center_size(pos2(slot.right() - 12.0, slot.center().y), Vec2::splat(28.0));
-                    let tone = MUTED.gamma_multiply(hover);
-                    if icon_button(
-                        ui,
-                        close,
-                        response.id.with("remove"),
-                        icon::X,
-                        glyph(13.0),
-                        tone,
-                        "Remove from queue",
-                    )
-                    .clicked()
-                    {
-                        out.push(Action::Remove(index));
-                    }
-                }
-                if response.clicked() {
-                    out.push(Action::Jump(index));
-                }
-            }
+            queue_rows(app, ui, true, out);
         });
     });
+}
+
+fn tab(ui: &Ui, at: Pos2, text: &str, active: bool) -> Response {
+    let galley = fit(ui, text, medium(13.5), TEXT, 160.0, 1);
+    let rect = Rect::from_min_size(at, vec2(galley.size().x + 28.0, 32.0));
+    let response = ui.interact(rect, Id::new(("tab", text)), Sense::click());
+    let hover = hover_of(ui, &response);
+    ui.painter().rect_filled(rect, 16.0, veil(if active { 0.12 } else { 0.06 * hover }));
+    let ink = if active { TEXT } else { MUTED.lerp_to_gamma(TEXT, hover) };
+    ui.painter()
+        .galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, ink);
+    describe(&response, text);
+    response
+}
+
+fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
+    let lyrics = match app.lyrics.as_ref().map(|(_, words)| words) {
+        Some(Words::Ready(lyrics)) => lyrics,
+        Some(Words::Missing) => {
+            message(
+                ui,
+                icon::SUBTITLES,
+                "No lyrics for this song",
+                "YouTube Music does not have them yet.",
+            );
+            return;
+        }
+        Some(Words::Failed) => {
+            message(ui, icon::WARNING_CIRCLE, "Lyrics did not load", "Open this tab again to retry.");
+            return;
+        }
+        Some(Words::Loading) | None => {
+            let pulse = veil(0.05 + 0.025 * (ui.input(|input| input.time) * 3.2).sin() as f32);
+            ui.ctx().request_repaint_after(Duration::from_millis(60));
+            for share in [0.7, 0.9, 0.55, 0.8, 0.65, 0.4] {
+                let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+                let bar = Rect::from_min_size(row.min + vec2(0.0, 10.0), vec2(row.width() * share, 20.0));
+                ui.painter().rect_filled(bar, 6.0, pulse);
+            }
+            return;
+        }
+    };
+    let position = app.player.position_ms();
+    let sung = lyrics
+        .synced
+        .then(|| lyrics.lines.iter().rposition(|(start, _)| *start <= position))
+        .flatten();
+    let follow = Id::new("lyrics-follow");
+    let moved = ui.data(|data| data.get_temp::<Option<usize>>(follow)) != Some(sung);
+    ui.data_mut(|data| data.insert_temp(follow, sung));
+    let width = ui.available_width();
+    let sense = if lyrics.synced { Sense::click() } else { Sense::hover() };
+    for (index, (start, line)) in lyrics.lines.iter().enumerate() {
+        if line.is_empty() {
+            ui.add_space(18.0);
+            continue;
+        }
+        let galley = fit(ui, line, bold(20.0), TEXT, width, 4);
+        let (rect, response) = ui.allocate_exact_size(vec2(width, galley.size().y + 14.0), sense);
+        let current = sung == Some(index);
+        if current && moved {
+            ui.scroll_to_rect(rect, Some(Align::Center));
+        }
+        if !ui.is_rect_visible(rect) {
+            continue;
+        }
+        let lit = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("lit"), current || !lyrics.synced, 0.25);
+        let hover = hover_of(ui, &response);
+        let ink = TEXT.gamma_multiply(0.34 + 0.66 * lit.max(0.5 * hover));
+        ui.painter().galley_with_override_text_color(rect.min + vec2(0.0, 7.0), galley, ink);
+        if lyrics.synced {
+            point_at(&response);
+        }
+        if response.clicked() {
+            out.push(Action::Seek(*start));
+        }
+    }
+    ui.add_space(12.0);
+    paragraph(ui, &lyrics.source, sans(12.0), FAINT, 2);
+    let next = sung.map_or(0, |index| index + 1);
+    if let (true, Some((start, _))) = (lyrics.synced && app.playing(), lyrics.lines.get(next)) {
+        let wait = start.saturating_sub(position).max(30);
+        ui.ctx().request_repaint_after(Duration::from_millis(wait));
+    }
+}
+
+fn queue_row(ui: &Ui, app: &App, item: &Item, slot: Rect, hover: f32) -> (Pos2, f32) {
+    ui.painter()
+        .rect_filled(slot.expand2(vec2(8.0, 0.0)), ROW_RADIUS, veil(0.06 * hover));
+    let art = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
+    artwork(ui, &app.art, app.saved.covers.of(item), art, 5.0);
+    let (left, width) = (art.right() + 12.0, slot.right() - art.right() - 44.0);
+    label(
+        ui,
+        pos2(left, slot.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        &item.title,
+        medium(13.5),
+        TEXT,
+        width,
+    );
+    (pos2(left, slot.center().y + 9.0), width)
+}
+
+fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> bool {
+    let queue = &app.saved.queue;
+    let upcoming = app.saved.current.map_or(0, |current| current + 1);
+    if upcoming >= queue.len() {
+        return false;
+    }
+    if heading {
+        eyebrow(ui, "Next up", 0.0);
+    }
+    let top = ui.cursor().top();
+    let pointer = ui.ctx().pointer_interact_pos();
+    let grab = Id::new("queue-grab");
+    let rows: Vec<(Rect, Response)> = (upcoming..queue.len())
+        .map(|_| ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ROW), Sense::click_and_drag()))
+        .collect();
+    let carried = rows.iter().position(|(_, row)| row.dragged() || row.drag_stopped());
+    if let (Some((slot, _)), Some(pointer)) = (rows.iter().find(|(_, row)| row.drag_started()), pointer) {
+        ui.data_mut(|data| data.insert_temp(grab, pointer.y - slot.top()));
+    }
+    let held = ui.data(|data| data.get_temp::<f32>(grab)).unwrap_or(QUEUE_ROW / 2.0);
+    let moving = carried.zip(pointer).map(|(from, pointer)| {
+        let lifted = pointer.y - held;
+        let over = ((lifted + QUEUE_ROW / 2.0 - top) / QUEUE_ROW).floor().max(0.0) as usize;
+        (from, over.min(rows.len() - 1), lifted)
+    });
+    let glide = if moving.is_some() { 0.12 } else { 0.0 };
+    for (at, (slot, response)) in rows.iter().enumerate() {
+        let (index, item) = (upcoming + at, &queue[upcoming + at]);
+        let aside = match moving {
+            Some((from, to, _)) if from < at && at <= to => -QUEUE_ROW,
+            Some((from, to, _)) if to <= at && at < from => QUEUE_ROW,
+            _ => 0.0,
+        };
+        let aside = ui.ctx().animate_value_with_time(response.id.with("aside"), aside, glide);
+        let slot = slot.translate(vec2(0.0, aside));
+        if moving.is_some_and(|(from, ..)| from == at) || !ui.is_rect_visible(slot) {
+            continue;
+        }
+        let hover = hover_of(ui, response);
+        let (below, width) = queue_row(ui, app, item, slot, hover);
+        byline(ui, out, item, response.id.with("artist"), below, sans(12.5), width);
+        describe(response, &item.title);
+        if hover > 0.0 {
+            let close = Rect::from_center_size(pos2(slot.right() - 12.0, slot.center().y), Vec2::splat(28.0));
+            let tone = MUTED.gamma_multiply(hover);
+            if icon_button(
+                ui,
+                close,
+                response.id.with("remove"),
+                icon::X,
+                glyph(13.0),
+                tone,
+                "Remove from queue",
+            )
+            .clicked()
+            {
+                out.push(Action::Remove(index));
+            }
+        }
+        if response.clicked() {
+            out.push(Action::Jump(index));
+        }
+    }
+
+    let Some((from, to, lifted)) = moving else { return true };
+    let (slot, response) = &rows[from];
+    if response.drag_stopped() {
+        let gap = if to > from { to + 1 } else { to };
+        out.push(Action::Move(upcoming + from, upcoming + gap));
+        return true;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    let lifted = slot.translate(vec2(0.0, lifted - slot.top()));
+    let plate = lifted.expand2(vec2(8.0, 0.0));
+    let layer = egui::LayerId::new(egui::Order::Tooltip, grab);
+    let ghost = ui.new_child(UiBuilder::new().layer_id(layer).max_rect(lifted));
+    let shadow = Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: shade(0.5),
+    };
+    ghost.painter().add(shadow.as_shape(plate, ROW_RADIUS));
+    ghost.painter().rect_filled(plate, ROW_RADIUS, FLOATING);
+    let item = &queue[upcoming + from];
+    let (below, width) = queue_row(&ghost, app, item, lifted, 0.0);
+    label(&ghost, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
+    true
+}
+
+fn now_playing(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Color32 {
+    let area = ui.max_rect();
+    let Some(item) = app.now_playing() else { return PANEL };
+    let shown = entrance(ui, Id::new("now-playing"));
+    ui.set_opacity(shown);
+    let cover = app.saved.covers.of(item);
+    let column = (area.width() * 0.32).clamp(320.0, 420.0);
+    let stage = Rect::from_min_max(area.min, pos2(area.right() - column - 24.0, area.bottom()));
+    let side = (stage.width() - 96.0).min(stage.height() - 230.0).clamp(120.0, STAGE_ART);
+    let tint = |size: f32| app.art.get(ui.ctx(), cover, size).map(|picture| picture.tint);
+    let glow = mood(ui, "stage", tint(side).or_else(|| tint(BAR_ART)), PANEL, 0.46);
+    let glow = dimmed(glow, STAGE_LUMINANCE);
+    wash(ui.painter(), area, glow, PANEL);
+
+    let close = Rect::from_center_size(area.min + vec2(44.0, 42.0), Vec2::splat(38.0));
+    if icon_button(ui, close, Id::new("stage-close"), icon::CARET_DOWN, glyph(19.0), MUTED, "Collapse").clicked() {
+        out.push(Action::Expand(false));
+    }
+
+    let centered = |text: &str, font: FontId, color: Color32, rows: usize| {
+        let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
+        job.halign = Align::Center;
+        job.wrap = TextWrapping {
+            max_width: (stage.width() - 64.0).min(side.max(440.0)),
+            max_rows: rows,
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        };
+        ui.painter().layout_job(job)
+    };
+    let size = match item.title.chars().count() {
+        0..=18 => 54.0,
+        19..=40 => 42.0,
+        _ => 34.0,
+    };
+    let title = centered(&item.title, display(size), TEXT, 2);
+    let artist = centered(&item.subtitle, sans(16.0), MUTED, 1);
+    let block = side + 30.0 + title.size().y + 8.0 + artist.size().y;
+    let top = (stage.center().y - block / 2.0).max(stage.top() + 56.0);
+    let art = Rect::from_min_size(pos2(stage.center().x - side / 2.0, top), Vec2::splat(side));
+    let shadow = Shadow {
+        offset: [0, 22],
+        blur: 56,
+        spread: 0,
+        color: shade(0.45),
+    };
+    ui.painter().add(shadow.as_shape(art, 18.0));
+    artwork(ui, &app.art, cover, art, 18.0);
+    let below = art.bottom() + 30.0;
+    let lower = below + title.size().y + 8.0;
+    ui.painter().galley(pos2(stage.center().x, below), title, TEXT);
+    let origin = pos2(stage.center().x, lower);
+    ui.painter().galley(origin, artist.clone(), MUTED);
+    artist_links(ui, out, item, Id::new("stage-artist"), origin, &artist);
+
+    let card = Rect::from_min_max(
+        pos2(stage.right(), area.top() + 24.0),
+        pos2(area.right() - 24.0, area.bottom() - 12.0),
+    );
+    ui.painter().rect_filled(card, 18.0, shade(0.24));
+    let lyrics = app.saved.lyrics_open;
+    let mut at = card.min + vec2(14.0, 14.0);
+    for (text, shows_lyrics) in [("Next up", false), ("Lyrics", true)] {
+        let tab = tab(ui, at, text, lyrics == shows_lyrics);
+        if tab.clicked() {
+            out.push(Action::ShowLyrics(shows_lyrics));
+        }
+        at.x = tab.rect.right() + 6.0;
+    }
+    let body = Rect::from_min_max(pos2(card.left(), card.top() + 56.0), card.max);
+    let margin = Margin {
+        left: 20,
+        right: 20,
+        top: 6,
+        bottom: 14,
+    };
+    let mut list = ui.new_child(UiBuilder::new().id_salt("stage-card").max_rect(body));
+    egui::ScrollArea::vertical()
+        .id_salt(lyrics)
+        .auto_shrink(false)
+        .show(&mut list, |ui| {
+            Frame::new().inner_margin(margin).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if lyrics {
+                    lyrics_view(app, ui, out);
+                } else if !queue_rows(app, ui, false, out) {
+                    message(ui, icon::QUEUE, "Nothing queued", "Songs you add line up here.");
+                }
+            });
+        });
+    PANEL.lerp_to_gamma(glow, shown)
 }
 
 fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
@@ -1630,13 +2108,20 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
     let mid = bar.center().y + 3.0;
     let duration = app.player.duration_ms();
     let item = app.now_playing();
+    let backdrop = ui.interact(bar, Id::new("bar-backdrop"), Sense::click());
+    if backdrop.clicked() && item.is_some() {
+        out.push(Action::Expand(!app.expanded));
+    }
 
     let zone = Rect::from_min_size(bar.min, vec2(bar.width(), 12.0));
     let sense = if duration > 0 { Sense::click_and_drag() } else { Sense::hover() };
     let scrubber = ui.interact(zone, Id::new("scrubber"), sense);
-    let pointed = scrubber
-        .interact_pointer_pos()
-        .map(|pointer| ((pointer.x - bar.left()) / bar.width()).clamp(0.0, 1.0));
+    if duration > 0 {
+        point_at(&scrubber);
+    }
+    let fraction_at = |pointer: Pos2| ((pointer.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
+    let pointed = scrubber.interact_pointer_pos().map(fraction_at);
+    let aimed = pointed.or(scrubber.hover_pos().map(fraction_at)).filter(|_| duration > 0);
     let mut position = app.player.position_ms().min(duration);
     if let (true, Some(fraction)) = (scrubber.dragged() || scrubber.is_pointer_button_down_on(), pointed) {
         position = (fraction * duration as f32) as u64;
@@ -1651,6 +2136,7 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
         hover: ui
             .ctx()
             .animate_bool_with_time(scrubber.id, scrubber.hovered() || scrubber.dragged(), HOVER_TIME),
+        aim: aimed.map(|fraction| (fraction, (fraction * duration as f32) as u64)),
     };
 
     match item {
@@ -1668,15 +2154,20 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
                 TEXT,
                 width,
             );
-            let artist = label(
-                ui,
-                pos2(left, mid + 10.0),
-                Align2::LEFT_CENTER,
-                &item.subtitle,
-                sans(12.5),
-                MUTED,
-                width,
-            );
+            let reach = left + fit(ui, &item.subtitle, sans(12.5), MUTED, width, 1).size().x;
+            let zone = Rect::from_min_max(art.min, pos2(title.right().max(reach), art.bottom()));
+            let open = ui.interact(zone, Id::new("bar-now-playing"), Sense::click());
+            let lift = hover_of(ui, &open);
+            let symbol = if app.expanded { icon::CARET_DOWN } else { icon::CARET_UP };
+            ui.painter().rect_filled(art, 6.0, shade(0.55 * lift));
+            ui.painter()
+                .text(art.center(), Align2::CENTER_CENTER, symbol, glyph(20.0), TEXT.gamma_multiply(lift));
+            describe(&open, "Now playing");
+            if open.clicked() {
+                out.push(Action::Expand(!app.expanded));
+            }
+            let below = pos2(left, mid + 10.0);
+            let artist = byline(ui, out, item, Id::new("bar-artist"), below, sans(12.5), width);
             let liked = app.saved.liked.iter().any(|liked| liked.video_id == item.video_id);
             let slot = Rect::from_center_size(pos2(title.right().max(artist.right()) + 26.0, mid), Vec2::splat(34.0));
             let (font, color, hint) = if liked {
@@ -1787,6 +2278,7 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
     let volume = app.saved.volume;
     let track = Rect::from_min_max(pos2(right - 96.0, mid - 8.0), pos2(right, mid + 8.0));
     let slider = ui.interact(track, Id::new("bar-volume"), Sense::click_and_drag());
+    point_at(&slider);
     let grip = ui
         .ctx()
         .animate_bool_with_time(slider.id, slider.hovered() || slider.dragged(), HOVER_TIME);
@@ -1846,6 +2338,22 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
     {
         out.push(Action::ToggleQueue);
     }
+    right -= 38.0;
+    let singing = app.expanded && app.saved.lyrics_open;
+    if icon_button(
+        ui,
+        Rect::from_center_size(pos2(right, mid), Vec2::splat(34.0)),
+        Id::new("bar-lyrics"),
+        icon::SUBTITLES,
+        glyph(18.0),
+        if singing { ACCENT } else { MUTED },
+        "Lyrics",
+    )
+    .clicked()
+    {
+        out.push(Action::ShowLyrics(true));
+        out.push(Action::Expand(!singing));
+    }
     right -= 34.0;
     if duration > 0 {
         let time = format!("{}  /  {}", clock(position), clock(duration));
@@ -1854,28 +2362,97 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
     scrub
 }
 
-fn paint_scrubber(painter: &egui::Painter, scrub: &Scrub) {
+fn paint_scrubber(ctx: &egui::Context, scrub: &Scrub) {
+    let painter = ctx.layer_painter(egui::LayerId::background());
     let height = 2.0 + 2.0 * scrub.hover;
     let span = |fraction: f32| Rect::from_min_size(scrub.bar.min - vec2(0.0, height / 2.0), vec2(scrub.bar.width() * fraction, height));
     painter.rect_filled(span(1.0), 0.0, rgb(0x26272C));
     painter.rect_filled(span(scrub.buffered), 0.0, rgb(0x45474E));
     painter.rect_filled(span(scrub.played), 0.0, ACCENT);
     painter.circle_filled(pos2(span(scrub.played).right(), scrub.bar.top()), 6.0 * scrub.hover, TEXT);
+
+    let Some((fraction, ms)) = scrub.aim else { return };
+    let mut painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("scrub-time")));
+    painter.set_opacity(scrub.hover);
+    let text = painter.layout_no_wrap(clock(ms), medium(12.5), TEXT);
+    let size = text.size() + vec2(20.0, 12.0);
+    let reach = (scrub.bar.width() - size.x) / 2.0 - 8.0;
+    let x = scrub.bar.center().x + (scrub.bar.width() * (fraction - 0.5)).clamp(-reach, reach);
+    let bubble = Rect::from_center_size(pos2(x, scrub.bar.top() - 14.0 - size.y / 2.0), size);
+    painter.rect(bubble, 9.0, FLOATING, Stroke::new(1.0, veil(0.1)), StrokeKind::Inside);
+    painter.galley(bubble.center() - text.size() / 2.0, text, TEXT);
 }
 
-fn notice(app: &App, ctx: &egui::Context) {
-    let Some((text, _)) = &app.notice else { return };
+fn notice(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
+    let Some(notice) = &app.notice else { return };
     egui::Area::new(Id::new("notice"))
         .order(egui::Order::Foreground)
         .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -(BAR_HEIGHT + 22.0)))
-        .interactable(false)
+        .interactable(notice.action.is_some())
         .show(ctx, |ui| {
-            Frame::new()
-                .fill(TEXT)
-                .corner_radius(22)
-                .inner_margin(Margin::symmetric(20, 12))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(text).font(medium(13.5)).color(PANEL));
-                });
+            let text = fit(ui, &notice.text, medium(13.5), PANEL, 420.0, 2);
+            let button = notice.action.as_ref().map(|(name, _)| fit(ui, name, bold(13.0), TEXT, 160.0, 1));
+            let button_width = button.as_ref().map_or(0.0, |name| name.size().x + 28.0 + 14.0);
+            let height = (text.size().y + 24.0).max(44.0);
+            let (toast, _) = ui.allocate_exact_size(vec2(20.0 + text.size().x + button_width + 20.0, height), Sense::hover());
+            ui.painter().rect_filled(toast, 22.0, TEXT);
+            ui.painter()
+                .galley(pos2(toast.left() + 20.0, toast.center().y - text.size().y / 2.0), text, PANEL);
+            let (Some(name), Some((hint, action))) = (button, &notice.action) else {
+                return;
+            };
+            let slot = Rect::from_min_max(
+                pos2(toast.right() - 8.0 - name.size().x - 28.0, toast.center().y - 15.0),
+                pos2(toast.right() - 8.0, toast.center().y + 15.0),
+            );
+            let response = ui.interact(slot, Id::new("notice-action"), Sense::click());
+            let hover = hover_of(ui, &response);
+            ui.painter().rect_filled(slot, 15.0, PANEL.lerp_to_gamma(ACCENT, hover));
+            let ink = TEXT.lerp_to_gamma(ON_ACCENT, hover);
+            ui.painter()
+                .galley_with_override_text_color(slot.center() - name.size() / 2.0, name, ink);
+            describe(&response, hint);
+            if response.clicked() {
+                out.push(action.clone());
+            }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_each_artist_name_to_its_own_page() {
+        let credit = |name: &str, id: &str| (name.to_owned(), id.to_owned());
+        let mut song = Item {
+            subtitle: "Çağrı Sinci, Şehinşah & Çağrı Sinci Jr • 4.9M plays".to_owned(),
+            artists: vec![
+                credit("Çağrı Sinci", "UC1"),
+                credit("Şehinşah", "UC2"),
+                credit("Çağrı Sinci Jr", "UC3"),
+            ],
+            ..Item::default()
+        };
+        assert_eq!(artist_spans(&song), [(0..11, "UC1"), (13..21, "UC2"), (24..38, "UC3")]);
+
+        song.artists = vec![credit("Çağrı Sinci Jr", "UC3"), credit("Şehinşah", "UC2"), credit("Nobody", "UC9")];
+        assert_eq!(artist_spans(&song), [(24..38, "UC3"), (13..21, "UC2")]);
+
+        song.artists.clear();
+        assert!(artist_spans(&song).is_empty());
+        song.artist_id = "UC1".to_owned();
+        assert_eq!(artist_spans(&song), [(0..51, "UC1")]);
+    }
+
+    #[test]
+    fn keeps_the_now_playing_tint_dark_enough_for_white_text() {
+        let contrast = |ink: Color32, paper: Color32| (luminance(ink) + 0.05) / (luminance(paper) + 0.05);
+        let pale = rgb(0x86917F);
+        assert!(contrast(TEXT, pale) < 3.0);
+        let tint = dimmed(pale, STAGE_LUMINANCE);
+        assert!(contrast(TEXT, tint) > 4.5);
+        assert!(tint.g() > tint.r() && tint.r() > tint.b());
+        assert_eq!(dimmed(PANEL, STAGE_LUMINANCE), PANEL);
+    }
 }

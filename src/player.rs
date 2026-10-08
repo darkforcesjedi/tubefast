@@ -1,5 +1,5 @@
 use crate::ytm;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
@@ -15,11 +15,16 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::{Time, TimeBase};
 
 const RANGE_BYTES: u64 = 1024 * 1024;
+const WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+const KEPT_BEHIND: u64 = 1024 * 1024;
+const BUFFERED_AHEAD: u64 = WINDOW_BYTES - KEPT_BEHIND - RANGE_BYTES;
+const WINDOW_POLL: Duration = Duration::from_millis(200);
 const MAX_STALLS: u32 = 5;
 const QUEUED_CHUNKS: usize = 24;
 const SILENCE_SAMPLES: usize = 512;
 const URL_LIFETIME: Duration = Duration::from_secs(3 * 60 * 60);
 const URL_CACHE_ENTRIES: usize = 64;
+const SELFTEST_FAR_SEEK_MS: u64 = 20 * 60 * 1000;
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 type Urls = Arc<Mutex<HashMap<String, (Instant, String, u64, u64)>>>;
@@ -52,30 +57,48 @@ enum Cmd {
     Seek { ms: u64, epoch: u64 },
 }
 
+#[derive(Default)]
+struct Window {
+    start: u64,
+    bytes: VecDeque<u8>,
+    reader: u64,
+}
+
+impl Window {
+    fn end(&self) -> u64 {
+        self.start + self.bytes.len() as u64
+    }
+}
+
 struct Fetch {
-    data: Mutex<Vec<u8>>,
-    grew: Condvar,
+    window: Mutex<Window>,
+    changed: Condvar,
     len: u64,
-    finished: AtomicBool,
+    failed: AtomicBool,
     generation: u64,
     shared: Arc<Shared>,
 }
 
 impl Fetch {
-    fn start(agent: ureq::Agent, url: String, len: u64, generation: u64, shared: Arc<Shared>) -> Arc<Fetch> {
+    fn start(yt: &ytm::Client, url: String, len: u64, generation: u64, shared: Arc<Shared>) -> Arc<Fetch> {
+        let (agent, user_agent) = (yt.agent.clone(), yt.player_agent());
+        let window = Window {
+            bytes: VecDeque::with_capacity(len.min(WINDOW_BYTES) as usize),
+            ..Window::default()
+        };
         let fetch = Arc::new(Fetch {
-            data: Mutex::new(Vec::with_capacity(len as usize)),
-            grew: Condvar::new(),
+            window: Mutex::new(window),
+            changed: Condvar::new(),
             len,
-            finished: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             generation,
             shared,
         });
         let worker = fetch.clone();
         std::thread::spawn(move || {
-            worker.download(&agent, &url);
-            worker.finished.store(true, Relaxed);
-            worker.grew.notify_all();
+            let complete = worker.download(&agent, &url, &user_agent);
+            worker.failed.store(!complete, Relaxed);
+            worker.changed.notify_all();
         });
         fetch
     }
@@ -84,33 +107,64 @@ impl Fetch {
         self.shared.generation.load(Relaxed) == self.generation
     }
 
-    fn download(&self, agent: &ureq::Agent, url: &str) {
-        let mut at = 0u64;
+    fn next_range(&self) -> Option<u64> {
+        let windowed = self.len > WINDOW_BYTES;
+        let mut window = self.window.lock().unwrap();
+        while self.current() {
+            if windowed {
+                if window.reader < window.start || window.reader > window.end() + RANGE_BYTES {
+                    window.bytes.clear();
+                    window.start = window.reader;
+                }
+                let played = window
+                    .reader
+                    .saturating_sub(window.start + KEPT_BEHIND)
+                    .min(window.bytes.len() as u64);
+                window.bytes.drain(..played as usize);
+                window.start += played;
+            }
+            let end = window.end();
+            if end < self.len && (!windowed || end < window.reader + BUFFERED_AHEAD) {
+                return Some(end);
+            }
+            if !windowed {
+                return None;
+            }
+            window = self.changed.wait_timeout(window, WINDOW_POLL).unwrap().0;
+        }
+        None
+    }
+
+    fn download(&self, agent: &ureq::Agent, url: &str, user_agent: &str) -> bool {
         let mut stalls = 0;
         let mut block = [0u8; 16 * 1024];
-        while at < self.len && stalls < MAX_STALLS && self.current() {
-            let before = at;
-            let end = (at + RANGE_BYTES).min(self.len) - 1;
-            let request = agent.get(&format!("{url}&range={at}-{end}")).set("User-Agent", ytm::PLAYER_UA);
+        while let Some(from) = self.next_range() {
+            let mut at = from;
+            let to = (from + RANGE_BYTES).min(self.len) - 1;
+            let request = agent.get(&format!("{url}&range={from}-{to}")).set("User-Agent", user_agent);
             if let Ok(response) = request.call() {
                 let mut body = response.into_reader();
                 while let Ok(read) = body.read(&mut block) {
                     if read == 0 || !self.current() {
                         break;
                     }
-                    self.data.lock().unwrap().extend_from_slice(&block[..read]);
+                    self.window.lock().unwrap().bytes.extend(&block[..read]);
                     at += read as u64;
-                    self.grew.notify_all();
+                    self.changed.notify_all();
                     self.shared.buffered.store((at * 1000 / self.len) as u32, Relaxed);
                 }
             }
-            if at == before {
-                stalls += 1;
-                std::thread::sleep(Duration::from_millis(400 * stalls as u64));
-            } else {
+            if at > from {
                 stalls = 0;
+                continue;
             }
+            stalls += 1;
+            if stalls >= MAX_STALLS {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(400 * stalls as u64));
         }
+        true
     }
 }
 
@@ -122,13 +176,20 @@ struct Reader {
 
 impl Read for Reader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let mut data = self.fetch.data.lock().unwrap();
+        let mut window = self.fetch.window.lock().unwrap();
         loop {
-            if (self.at as usize) < data.len() {
-                let start = self.at as usize;
-                let count = out.len().min(data.len() - start);
-                out[..count].copy_from_slice(&data[start..start + count]);
+            window.reader = self.at;
+            if self.at >= window.start && self.at < window.end() {
+                let offset = (self.at - window.start) as usize;
+                let mut count = 0;
+                for (slot, byte) in out.iter_mut().zip(window.bytes.range(offset..)) {
+                    *slot = *byte;
+                    count += 1;
+                }
                 self.at += count as u64;
+                window.reader = self.at;
+                drop(window);
+                self.fetch.changed.notify_all();
                 return Ok(count);
             }
             if !self.fetch.current() {
@@ -137,10 +198,11 @@ impl Read for Reader {
             if self.at >= self.fetch.len {
                 return Ok(0);
             }
-            if self.fetch.finished.load(Relaxed) {
+            if self.fetch.failed.load(Relaxed) {
                 return Err(io::Error::other("The connection was lost while streaming"));
             }
-            data = self.fetch.grew.wait_timeout(data, Duration::from_millis(200)).unwrap().0;
+            self.fetch.changed.notify_all();
+            window = self.fetch.changed.wait_timeout(window, WINDOW_POLL).unwrap().0;
         }
     }
 }
@@ -184,7 +246,7 @@ impl Track {
             shared.duration_ms.store(duration_ms, Relaxed);
         }
         let seekable = Arc::new(AtomicBool::new(false));
-        let fetch = Fetch::start(yt.agent.clone(), url, len, generation, shared.clone());
+        let fetch = Fetch::start(yt, url, len, generation, shared.clone());
         let reader = Reader {
             fetch,
             at: 0,
@@ -399,7 +461,15 @@ fn decode_loop(
                 (track, pending, resume, epoch) = (None, None, None, started);
                 let (replies, shared, yt, urls) = (replies.clone(), shared.clone(), yt.clone(), urls.clone());
                 std::thread::spawn(move || {
-                    let reply = match Track::open(&yt, &urls, &video_id, generation, &shared) {
+                    let opened = Track::open(&yt, &urls, &video_id, generation, &shared).or_else(|message| {
+                        urls.lock().unwrap().remove(&video_id);
+                        if shared.generation.load(Relaxed) == generation && yt.refresh_clients() {
+                            Track::open(&yt, &urls, &video_id, generation, &shared)
+                        } else {
+                            Err(message)
+                        }
+                    });
+                    let reply = match opened {
                         Ok(track) => Cmd::Opened(track),
                         Err(message) => {
                             urls.lock().unwrap().remove(&video_id);
@@ -595,21 +665,29 @@ pub fn selftest(query: &str) -> Result<String, String> {
         peak = chunk.samples.iter().fold(peak, |peak, sample| peak.max(sample.abs()));
         rate = chunk.rate;
     }
-    track.seek(60_000);
-    let after_seek = track.next_chunk(0)?.ok_or("seek ran past the end")?.start_ms;
-    track.seek(5_000);
-    let after_rewind = track.next_chunk(0)?.ok_or("rewind failed")?.start_ms;
     if peak <= 0.001 {
         return Err("decoded audio is silent".to_owned());
     }
-    if !(59_000..=61_000).contains(&after_seek) || !(4_000..=6_000).contains(&after_rewind) {
-        return Err(format!("seek landed at {after_seek} ms and {after_rewind} ms"));
+    let duration = shared.duration_ms.load(Relaxed);
+    let far = if duration > SELFTEST_FAR_SEEK_MS + 60_000 {
+        SELFTEST_FAR_SEEK_MS
+    } else {
+        60_000
+    };
+    let seeking = Instant::now();
+    for target in [60_000, 5_000, far, 5_000] {
+        track.seek(target);
+        let landed = track.next_chunk(0)?.ok_or("seek ran past the end")?.start_ms;
+        if landed.abs_diff(target) > 1000 {
+            return Err(format!("seek to {target} ms landed at {landed} ms"));
+        }
     }
     Ok(format!(
-        "ok: \"{}\" by {} | search {searched:.0?} | open {opened:.0?} | {rate} Hz, peak {peak:.2} | seek 60s -> {after_seek} ms, 5s -> {after_rewind} ms | radio {} tracks | duration {} ms",
+        "ok: \"{}\" by {} | search {searched:.0?} | open {opened:.0?} | {rate} Hz, peak {peak:.2} | seeks to 60s, 5s, {}s, 5s in {:.0?} | radio {} tracks | duration {duration} ms",
         song.title,
         song.subtitle,
+        far / 1000,
+        seeking.elapsed(),
         radio.len(),
-        shared.duration_ms.load(Relaxed),
     ))
 }

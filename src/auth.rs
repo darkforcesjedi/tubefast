@@ -19,6 +19,20 @@ const BROWSERS: [(&str, &str); 4] = [
     ("ProgramFiles", r"Google\Chrome\Application\chrome.exe"),
     ("LocalAppData", r"Google\Chrome\Application\chrome.exe"),
 ];
+const BROWSERS_ELSEWHERE: [&str; 7] = [
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "microsoft-edge",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+];
+pub const SESSION_KEPT: &str = if cfg!(windows) {
+    "The session stays on this computer, encrypted with your Windows account."
+} else {
+    "The session stays on this computer, in a file only your user account can read."
+};
 
 fn sapisid(cookie: &str) -> Option<&str> {
     let value = |name: &str| cookie.split("; ").find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='));
@@ -58,8 +72,12 @@ fn session_file() -> Option<PathBuf> {
 pub fn store(cookie: &str) -> Result<(), String> {
     let sealed = seal(cookie.as_bytes(), true).ok_or("This sign-in cannot be kept after a restart on this system.")?;
     let file = session_file().ok_or("There is no folder to keep the sign-in in.")?;
+    let mut private = std::fs::OpenOptions::new();
+    private.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut private, 0o600);
     std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))
-        .and_then(|()| std::fs::write(file, sealed))
+        .and_then(|()| private.open(file)?.write_all(&sealed))
         .map_err(|e| e.to_string())
 }
 
@@ -102,8 +120,8 @@ fn seal(data: &[u8], protect: bool) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(windows))]
-fn seal(_data: &[u8], _protect: bool) -> Option<Vec<u8>> {
-    None
+fn seal(data: &[u8], _protect: bool) -> Option<Vec<u8>> {
+    Some(data.to_vec())
 }
 
 struct Socket {
@@ -208,18 +226,26 @@ fn youtube_cookie(reply: &Value) -> Option<String> {
 }
 
 fn launch(profile: &Path, extra: &[&str]) -> Result<Child, String> {
-    let program = BROWSERS
+    let installed = BROWSERS
         .iter()
-        .filter_map(|(root, path)| Some(PathBuf::from(std::env::var_os(root)?).join(path)))
-        .find(|path| path.exists())
-        .ok_or("Neither Edge nor Chrome was found on this computer.")?;
+        .filter_map(|(root, path)| Some(PathBuf::from(std::env::var_os(root)?).join(path)));
+    let programs: Vec<PathBuf> = if cfg!(windows) {
+        installed.collect()
+    } else {
+        BROWSERS_ELSEWHERE.iter().map(PathBuf::from).collect()
+    };
     let _ = std::fs::remove_dir_all(profile);
-    Command::new(program)
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .args(["--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check"])
-        .args(extra)
-        .spawn()
-        .map_err(|e| format!("The browser did not start: {e}"))
+    programs
+        .iter()
+        .find_map(|program| {
+            Command::new(program)
+                .arg(format!("--user-data-dir={}", profile.display()))
+                .args(["--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check"])
+                .args(extra)
+                .spawn()
+                .ok()
+        })
+        .ok_or_else(|| "Neither Edge nor Chrome was found on this computer.".to_owned())
 }
 
 fn watch(browser: &mut Child, profile: &Path, cancel: &AtomicBool) -> Result<String, String> {

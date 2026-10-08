@@ -41,3 +41,9 @@ body:
       label: Output of `tubefast --selftest`
       description: Only needed when search or playback is involved. Run it from a terminal.
       render: text
+  - type: textarea
+    id: crash
+    attributes:
+      label: Contents of `crash.log`
+      description: Only if Tubefast closed by itself. The file is in `%APPDATA%\tubefast\data`.
+      render: text

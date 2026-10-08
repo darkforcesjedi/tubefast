@@ -3,16 +3,24 @@
 mod app;
 mod art;
 mod auth;
+mod media;
 mod player;
 mod ui;
+mod update;
 mod ytm;
 
 use eframe::egui;
+use std::io::Write;
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const APP_NAME: &str = "Tubefast";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_ID: &str = "tubefast";
-const LEGACY_ID: &str = "plak";
+const CRASH_LOG: &str = "crash.log";
+const CRASH_LOG_BYTES: u64 = 64 * 1024;
+const PROFILE_FLAG: &str = "--profile";
+const PREVIOUS_VERSION_EXIT: Duration = Duration::from_millis(800);
 static PROFILE: OnceLock<String> = OnceLock::new();
 
 pub fn app_id() -> &'static str {
@@ -20,13 +28,24 @@ pub fn app_id() -> &'static str {
 }
 
 fn take_profile(arguments: &mut Vec<String>) {
-    let Some(at) = arguments.iter().position(|argument| argument == "--profile") else {
+    let Some(at) = arguments.iter().position(|argument| argument == PROFILE_FLAG) else {
         return;
     };
     let name = arguments.drain(at..(at + 2).min(arguments.len())).nth(1).unwrap_or_default();
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         let _ = PROFILE.set(format!("{APP_ID}-{name}"));
     }
+}
+
+pub fn profile_arguments() -> Vec<String> {
+    let name = PROFILE.get().and_then(|id| id.strip_prefix(APP_ID)?.strip_prefix('-'));
+    name.map(|name| vec![PROFILE_FLAG.to_owned(), name.to_owned()]).unwrap_or_default()
+}
+
+fn take_updated(arguments: &mut Vec<String>) -> bool {
+    let before = arguments.len();
+    arguments.retain(|argument| argument != update::UPDATED_FLAG);
+    arguments.len() < before
 }
 
 #[cfg(windows)]
@@ -38,25 +57,33 @@ fn attach_console() {
 #[cfg(not(windows))]
 fn attach_console() {}
 
-fn adopt_legacy_data() {
-    if PROFILE.get().is_some() {
-        return;
-    }
-    let (Some(old), Some(new)) = (eframe::storage_dir(LEGACY_ID), eframe::storage_dir(APP_ID)) else {
-        return;
-    };
-    if !old.exists() || new.exists() {
-        return;
-    }
-    let moved = new.parent().is_some_and(|folder| std::fs::create_dir_all(folder).is_ok()) && std::fs::rename(&old, &new).is_ok();
-    if let Some(folder) = old.parent().filter(|folder| moved && folder.ends_with(LEGACY_ID)) {
-        let _ = std::fs::remove_dir(folder);
-    }
+fn log_crashes() {
+    let Some(folder) = eframe::storage_dir(app_id()) else { return };
+    std::panic::set_hook(Box::new(move |panic| {
+        let file = folder.join(CRASH_LOG);
+        let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
+        let grown = std::fs::metadata(&file).is_ok_and(|log| log.len() > CRASH_LOG_BYTES);
+        let _ = std::fs::create_dir_all(&folder);
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(!grown)
+            .write(true)
+            .truncate(grown)
+            .open(file);
+        if let Ok(mut log) = log {
+            let _ = writeln!(log, "{APP_NAME} {VERSION} at unix {seconds}: {panic}");
+        }
+    }));
 }
 
 fn main() -> eframe::Result {
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     take_profile(&mut arguments);
+    log_crashes();
+    if take_updated(&mut arguments) {
+        std::thread::sleep(PREVIOUS_VERSION_EXIT);
+    }
+    update::clear_leftovers();
     let mut arguments = arguments.into_iter();
     let (flag, value) = (arguments.next(), arguments.next());
     if flag.as_deref() == Some("--selftest") {
@@ -75,7 +102,6 @@ fn main() -> eframe::Result {
         (Some(query), None) if !query.starts_with("--") => (Some(query), false),
         _ => (None, false),
     };
-    adopt_legacy_data();
     let viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_app_id(app_id())

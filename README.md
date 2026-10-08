@@ -26,11 +26,11 @@ Tubefast is a YouTube Music client written in Rust with [egui](https://github.co
 | | Measured |
 |---|---|
 | Window on screen | 0.1 to 0.3 seconds |
-| Memory | about 90 MB after start, 100 to 180 MB in long sessions |
+| Memory | about 100 MB while playing, about 60 MB of it private |
 | CPU while playing | under 1 % |
-| Download | one `.exe`, under 10 MB |
+| Download | one `.exe`, about 9 MB |
 
-Numbers are from the release build on Windows 11. Memory grows with window size and with how much artwork you have scrolled past.
+Numbers are from the release build on Windows 11. Memory is the working set a few seconds into playback, and it grows with window size and with how much artwork you have scrolled past. The first launch from a new folder used about 60 MB more on the test machine (NVIDIA driver), once.
 
 ## What you get
 
@@ -38,6 +38,10 @@ Numbers are from the release build on Windows 11. Memory grows with window size 
 |---|---|
 | **Search and browse** | Results appear as you type. Artist, album and playlist pages, with back and forward history. |
 | **A queue that keeps going** | Play an album or a single song. When the queue runs out, a radio based on the last track continues it. Shuffle and repeat included. |
+| **A queue you cannot lose** | Close the app and the queue, the track and the position are still there next time. Replace a queue you built by accident and **Undo** brings it back. Drag a row to reorder what plays next. |
+| **Now playing and lyrics** | Click the cover or the title in the bar for a full-window view of the track. Its lyrics tab follows the song line by line when YouTube Music has timed lyrics, and shows plain text when it does not. |
+| **Updates itself** | When a new version is out, Tubefast tells you and installs it with one click, then restarts with your queue where it was. |
+| **Media keys** | Play, pause, next and previous keys work from any window, and the track shows up in the Windows media overlay. |
 | **A home feed that knows you** | Signed out, the feed is built from what you played here. Signed in, you get your own YouTube Music feed and playlists. |
 | **Your library, kept locally** | Liked songs, listening history and saved albums, playlists and artists live on your computer. |
 | **Real covers** | Music videos show the album cover of the song instead of a video frame whenever YouTube knows which song it is. |
@@ -46,12 +50,29 @@ Numbers are from the release build on Windows 11. Memory grows with window size 
 
 ## Install
 
+**With [Scoop](https://scoop.sh)**, which shows no Windows warning:
+
+```sh
+scoop install https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast.json
+```
+
+**By hand:**
+
 1. Download `tubefast-windows-x64.zip` from the [latest release](https://github.com/yigitbozyaka/tubefast/releases/latest).
-2. Unzip it anywhere and run `tubefast.exe`.
+2. Right-click the zip, choose **Properties**, tick **Unblock** and press **OK**.
+3. Unzip it anywhere and run `tubefast.exe`.
 
-The binary is not code signed, so Windows SmartScreen may warn on first launch. Choose **More info**, then **Run anyway**.
+Step 2 is there because Tubefast is not code signed. Windows trusts a new program only after enough people have run it, so without that step the first launch shows "Windows protected your PC". If you see it, choose **More info**, then **Run anyway**.
 
-Windows is the only tested platform today. Only sign-in and font fallback lean on Windows itself, so Linux and macOS ports are welcome. See [Contributing](CONTRIBUTING.md).
+You can check that a download was built from this repository by GitHub, not by anyone else:
+
+```sh
+gh attestation verify tubefast-windows-x64.zip --repo yigitbozyaka/tubefast
+```
+
+Each release also lists the SHA-256 of the zip in `SHA256SUMS.txt`.
+
+Windows is the only platform anyone has used it on. The code also builds and passes its tests on Linux in CI, but media keys, the browser sign-in window, staying signed in after a restart and the font fallback for non-Latin scripts are Windows only for now. Linux and macOS ports are welcome. See [Contributing](CONTRIBUTING.md).
 
 ## Signing in
 
@@ -69,6 +90,9 @@ Your session never leaves your computer. It is stored in your user profile, encr
 | `Space` | Play or pause |
 | `Ctrl` + `K` or `/` | Jump to search |
 | `Ctrl` + `→` / `Ctrl` + `←` | Next / previous track |
+| `Ctrl` + `Z` | Bring back the queue you just replaced |
+| `Esc` | Close the now playing view |
+| Media keys | Play or pause, next, previous, from any window |
 | `Alt` + `←` / `Alt` + `→` | Back / forward |
 | `F5` or `Ctrl` + `R` | Reload the page |
 
@@ -96,19 +120,21 @@ cargo run --release
 ## How it works
 
 - **Data** comes from the same internal API the YouTube Music website uses. Responses are parsed while streaming and the parts Tubefast never shows are skipped before they are allocated.
-- **Audio** is fetched progressively, decoded with [Symphonia](https://github.com/pdeljanov/Symphonia) on its own thread and handed to [rodio](https://github.com/RustAudio/rodio). The interface never waits for the network.
+- **Audio** is fetched progressively, decoded with [Symphonia](https://github.com/pdeljanov/Symphonia) on its own thread and handed to [rodio](https://github.com/RustAudio/rodio). The interface never waits for the network. Tracks longer than about eight minutes keep a sliding 8 MB window in memory instead of the whole file, so an hour-long mix costs the same as a song.
 - **The interface** is immediate-mode egui on OpenGL. It repaints only when something changes, so an idle window uses no CPU.
 
 ## Good to know
 
 - **Tubefast is unofficial.** It is not affiliated with, endorsed by or sponsored by YouTube or Google. YouTube and YouTube Music are trademarks of Google LLC.
-- **It can break.** YouTube changes its internal API without notice. When playback stops working, `tubefast --selftest` tells you which step failed, and a fix is usually a matter of updating a few constants.
+- **It can break.** YouTube changes its internal API without notice. The settings that usually need changing live in one small file, [`clients.json`](clients.json). When playback fails, Tubefast fetches the current copy from this repository and tries again, so most breakages are fixed for everyone with one commit and no new download. `tubefast --selftest` tells you which step failed.
+- **What it talks to.** YouTube, and GitHub. At start it reads `clients.json` and checks whether a newer release exists. A new version is downloaded only when you click **Update**, from this repository's releases, and is installed only if it matches the SHA-256 published with the release. Copies installed with Scoop are updated with `scoop update tubefast` instead. Nothing about you is sent, and there is no telemetry.
+- **If it crashes,** the reason is written to `crash.log` next to your data (`%APPDATA%\tubefast\data`). Attach it to your bug report.
 - **Use it at your own risk.** YouTube's Terms of Service do not provide for third-party clients. Nobody can promise how YouTube treats accounts that use one. If that worries you, stay signed out.
 - **Audio quality** is 128 kbps AAC for now.
 
 ## Not there yet
 
-Media keys and the Windows media overlay, a tray icon, lyrics, syncing likes back to your account, higher audio quality, a light theme, an installer, and Linux and macOS builds. Pull requests for any of these are welcome.
+A tray icon, syncing likes back to your account, higher audio quality, a light theme, an installer, and Linux and macOS builds. Pull requests for any of these are welcome.
 
 ## Acknowledgements
 

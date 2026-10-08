@@ -13,8 +13,9 @@ const MAX_DOWNLOAD_BYTES: u64 = 6 * 1024 * 1024;
 const RETRY_AFTER: Duration = Duration::from_secs(20);
 const SIZES: [u32; 4] = [64, 128, 256, 512];
 
-type Jobs = Arc<(Mutex<Vec<(String, u32)>>, Condvar)>;
-type Loaded = (String, Option<(ColorImage, Color32)>);
+type Sized = (String, u32);
+type Jobs = Arc<(Mutex<Vec<Sized>>, Condvar)>;
+type Loaded = (Sized, Option<(ColorImage, Color32)>);
 
 #[derive(Clone, Copy)]
 pub struct Picture {
@@ -35,7 +36,7 @@ enum Slot {
 
 #[derive(Default)]
 struct Cache {
-    slots: HashMap<String, Slot>,
+    slots: HashMap<Sized, Slot>,
     frame: u64,
     bytes: usize,
 }
@@ -65,13 +66,13 @@ impl Art {
         let mut cache = self.cache.borrow_mut();
         cache.frame += 1;
         let frame = cache.frame;
-        while let Ok((url, result)) = self.loaded.try_recv() {
+        while let Ok((key, result)) = self.loaded.try_recv() {
             let slot = match result {
                 Some((image, tint)) => {
                     let bytes = image.width() * image.height() * 4;
                     cache.bytes += bytes;
                     Slot::Ready {
-                        texture: ctx.load_texture(&url, image, TextureOptions::LINEAR),
+                        texture: ctx.load_texture(&key.0, image, TextureOptions::LINEAR),
                         tint,
                         used: frame,
                         bytes,
@@ -79,23 +80,23 @@ impl Art {
                 }
                 None => Slot::Failed(Instant::now()),
             };
-            cache.slots.insert(url, slot);
+            cache.slots.insert(key, slot);
         }
         if cache.bytes > BUDGET_BYTES {
-            let mut idle: Vec<(u64, usize, String)> = cache
+            let mut idle: Vec<(u64, usize, Sized)> = cache
                 .slots
                 .iter()
-                .filter_map(|(url, slot)| match slot {
-                    Slot::Ready { used, bytes, .. } if used + 1 < frame => Some((*used, *bytes, url.clone())),
+                .filter_map(|(key, slot)| match slot {
+                    Slot::Ready { used, bytes, .. } if used + 1 < frame => Some((*used, *bytes, key.clone())),
                     _ => None,
                 })
                 .collect();
             idle.sort_unstable();
-            for (_, bytes, url) in idle {
+            for (_, bytes, key) in idle {
                 if cache.bytes <= BUDGET_BYTES * 3 / 4 {
                     break;
                 }
-                cache.slots.remove(&url);
+                cache.slots.remove(&key);
                 cache.bytes -= bytes;
             }
         }
@@ -107,7 +108,7 @@ impl Art {
         }
         let wanted = (points * ctx.pixels_per_point()).ceil() as u32;
         let px = SIZES.into_iter().find(|size| *size >= wanted).unwrap_or(SIZES[SIZES.len() - 1]);
-        let key = ytm::sized(url, px);
+        let key = (ytm::sized(url, px), px);
         let mut cache = self.cache.borrow_mut();
         let frame = cache.frame;
         match cache.slots.get_mut(&key) {
@@ -123,7 +124,7 @@ impl Art {
             _ => {}
         }
         cache.slots.insert(key.clone(), Slot::Loading);
-        self.jobs.0.lock().unwrap().push((key, px));
+        self.jobs.0.lock().unwrap().push(key);
         self.jobs.1.notify_one();
         None
     }
@@ -131,7 +132,7 @@ impl Art {
 
 fn work(ctx: egui::Context, agent: ureq::Agent, jobs: Jobs, sender: Sender<Loaded>) {
     loop {
-        let (url, px) = {
+        let key = {
             let mut queue = jobs.0.lock().unwrap();
             loop {
                 match queue.pop() {
@@ -140,15 +141,15 @@ fn work(ctx: egui::Context, agent: ureq::Agent, jobs: Jobs, sender: Sender<Loade
                 }
             }
         };
-        let result = load(&agent, &url, px);
-        if sender.send((url, result)).is_err() {
+        let result = load(&agent, &key.0, key.1);
+        if sender.send((key, result)).is_err() {
             return;
         }
         ctx.request_repaint();
     }
 }
 
-fn load(agent: &ureq::Agent, url: &str, px: u32) -> Option<(ColorImage, Color32)> {
+fn fetch(agent: &ureq::Agent, url: &str) -> Option<image::DynamicImage> {
     let mut bytes = Vec::new();
     agent
         .get(url)
@@ -158,7 +159,12 @@ fn load(agent: &ureq::Agent, url: &str, px: u32) -> Option<(ColorImage, Color32)
         .take(MAX_DOWNLOAD_BYTES)
         .read_to_end(&mut bytes)
         .ok()?;
-    let decoded = image::load_from_memory(&bytes).ok()?;
+    image::load_from_memory(&bytes).ok()
+}
+
+fn load(agent: &ureq::Agent, url: &str, px: u32) -> Option<(ColorImage, Color32)> {
+    let sharp = ytm::sharper(url, px).and_then(|sharp| fetch(agent, &sharp));
+    let decoded = sharp.or_else(|| fetch(agent, url))?;
     let side = decoded.width().min(decoded.height());
     let square = decoded.crop_imm((decoded.width() - side) / 2, (decoded.height() - side) / 2, side, side);
     let fitted = if side > px { square.thumbnail_exact(px, px) } else { square };

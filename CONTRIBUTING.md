@@ -28,12 +28,23 @@ cargo test
 
 `cargo test -- --include-ignored` also drives the sign-in flow through a real headless Edge or Chrome.
 
+## Branches and pull requests
+
+`master` is protected: every change arrives through a pull request, and CI has to pass before it can be merged.
+
+1. Fork the repository and create a branch from `master`.
+2. Make your change and run the three checks above.
+3. Open a pull request against `master`. Pull requests are squashed into one commit when merged.
+
 ## Where things live
 
 | File | What it does |
 |---|---|
-| `src/ytm.rs` | The YouTube client: requests, response parsing, stream lookup. Client versions and other values YouTube may change sit at the top. |
+| `src/ytm.rs` | The YouTube client: requests, response parsing, stream lookup. |
+| `clients.json` | The client name, version and user agent YouTube expects. The values that change when YouTube breaks something. |
 | `src/player.rs` | Progressive download, decoding thread and audio output. |
+| `src/media.rs` | Media keys and the Windows media overlay. |
+| `src/update.rs` | The in-app updater: download, checksum, replacing the running program, restart. |
 | `src/auth.rs` | Sign-in: cookie handling, request signing, encrypted storage, the browser flow. |
 | `src/art.rs` | Artwork download, decode and texture cache with a memory budget. |
 | `src/app.rs` | Application state. Applies the actions the interface emits. |
@@ -49,4 +60,6 @@ cargo test
 
 ## When YouTube breaks something
 
-Playback or browsing can stop working when YouTube changes its internal API. Run `tubefast --selftest` to see which step fails. The fix is usually an updated client name, version or user agent in the constants at the top of `src/ytm.rs`. The [yt-dlp](https://github.com/yt-dlp/yt-dlp) project tracks the working values in `yt_dlp/extractor/youtube/_base.py`.
+Playback or browsing can stop working when YouTube changes its internal API. Run `tubefast --selftest` to see which step fails. The fix is usually an updated client name, version or user agent in [`clients.json`](clients.json). The [yt-dlp](https://github.com/yt-dlp/yt-dlp) project tracks the working values in `yt_dlp/extractor/youtube/_base.py`.
+
+`clients.json` is built into every release and is also read from the `master` branch by installed copies, at start and again when playback fails. A fix merged there reaches everyone within minutes, without a new release. Check a change with `cargo run -- --selftest` before you open the pull request, because a wrong value breaks playback for every installed copy.

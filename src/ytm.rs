@@ -3,25 +3,21 @@ use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess,
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MUSIC_API: &str = "https://music.youtube.com/youtubei/v1/";
 const PLAYER_API: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 const VISITOR_API: &str = "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false";
 const LANGUAGE: &str = "en";
 const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
-const REMIX_VERSION: &str = "1.20260707.12.00";
 const REMIX_CLIENT_ID: &str = "67";
-const PLAYER_CLIENT: &str = "VISIONOS";
-const PLAYER_VERSION: &str = "1.02";
-const PLAYER_CLIENT_ID: &str = "101";
-const PLAYER_DEVICE: &str = "RealityDevice17,1";
-const PLAYER_OS: &str = "26.5.23O471";
-pub const PLAYER_UA: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+const BUNDLED_CLIENTS: &str = include_str!("../clients.json");
+const LATEST_CLIENTS: &str = "https://raw.githubusercontent.com/yigitbozyaka/tubefast/master/clients.json";
+const CLIENTS_BYTES: u64 = 16 * 1024;
+const CLIENTS_RETRY: Duration = Duration::from_secs(10 * 60);
 const WATCH_API: &str = "https://www.youtube.com/youtubei/v1/next?prettyPrint=false";
 const MWEB_VERSION: &str = "2.20260708.05.00";
 const MWEB_CLIENT_ID: &str = "2";
@@ -31,13 +27,24 @@ const COVER_HOST: &str = "googleusercontent.com";
 const THUMB_WIDTH: u64 = 700;
 const COVER_SIZE: &str = "=w544-h544-l90-rj";
 pub const VIDEO_FRAME_HOST: &str = "i.ytimg.com";
+pub const QUICK_PICKS: &str = "Quick picks";
+const LISTED_FRAME_SIDE: u32 = 256;
+const SHARP_FRAME: &str = "maxresdefault.jpg";
+const LYRICS_TAB: &str = "MPLY";
+const LYRICS_CLIENT: &str = "ANDROID_MUSIC";
+const LYRICS_VERSION: &str = "7.21.50";
+const LYRICS_CLIENT_ID: &str = "21";
+const LYRICS_UA: &str = "com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 14) gzip";
 const AAC_ITAG: u64 = 140;
 const RELATED_ITEMS: usize = 18;
 const EXPLORE_ORDER: usize = 100;
 const HOME_ORDER: usize = 200;
 const PERSONAL_PAGES: usize = 3;
+const LIKED_SONGS: &str = "VLLM";
+const LIKED_PAGES: usize = 50;
 const SESSION_REJECTED: &str = "YouTube did not accept this sign-in. Sign in again.";
-const UNUSED_KEYS: [&str; 13] = [
+const UNUSED_KEYS: [&str; 14] = [
+    "counterpart",
     "menu",
     "thumbnailOverlay",
     "trackingParams",
@@ -65,6 +72,8 @@ pub struct Item {
     pub artist_id: String,
     pub album_id: String,
     pub is_artist: bool,
+    #[serde(default)]
+    pub artists: Vec<(String, String)>,
 }
 
 impl Item {
@@ -116,10 +125,42 @@ pub struct Stream {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, PartialEq)]
+pub struct Lyrics {
+    pub lines: Vec<(u64, String)>,
+    pub synced: bool,
+    pub source: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Account {
     pub name: String,
     pub photo: String,
+}
+
+#[derive(Deserialize, PartialEq)]
+struct Clients {
+    remix_version: String,
+    player: PlayerClient,
+}
+
+#[derive(Deserialize, PartialEq)]
+struct PlayerClient {
+    id: String,
+    user_agent: String,
+    client: Value,
+}
+
+impl Clients {
+    fn parse(json: &str) -> Option<Clients> {
+        let clients: Clients = serde_json::from_str(json).ok()?;
+        let named = |key: &str| clients.player.client[key].as_str().is_some_and(|value| !value.is_empty());
+        let complete = named("clientName") && named("clientVersion");
+        let filled = [&clients.remix_version, &clients.player.id, &clients.player.user_agent]
+            .iter()
+            .all(|value| !value.is_empty());
+        (complete && filled).then_some(clients)
+    }
 }
 
 pub struct Client {
@@ -127,6 +168,8 @@ pub struct Client {
     visitor: Mutex<String>,
     session: Mutex<Option<String>>,
     expired: AtomicBool,
+    clients: Mutex<Clients>,
+    clients_checked: Mutex<Option<Instant>>,
 }
 
 impl Client {
@@ -141,7 +184,34 @@ impl Client {
             visitor: Mutex::new(visitor),
             session: Mutex::new(None),
             expired: AtomicBool::new(false),
+            clients: Mutex::new(Clients::parse(BUNDLED_CLIENTS).expect("the bundled clients.json should be complete")),
+            clients_checked: Mutex::new(None),
         }
+    }
+
+    pub fn refresh_clients(&self) -> bool {
+        let mut checked = self.clients_checked.lock().unwrap();
+        if checked.is_some_and(|at| at.elapsed() < CLIENTS_RETRY) {
+            return false;
+        }
+        *checked = Some(Instant::now());
+        let latest = self.agent.get(LATEST_CLIENTS).call().ok().and_then(|response| {
+            let mut json = String::new();
+            response.into_reader().take(CLIENTS_BYTES).read_to_string(&mut json).ok()?;
+            Clients::parse(&json)
+        });
+        let mut clients = self.clients.lock().unwrap();
+        match latest {
+            Some(latest) if latest != *clients => {
+                *clients = latest;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn player_agent(&self) -> String {
+        self.clients.lock().unwrap().player.user_agent.clone()
     }
 
     pub fn visitor(&self) -> String {
@@ -215,10 +285,32 @@ impl Client {
             let Some(token) = continuation(&response).filter(|_| step + 1 < pages) else {
                 break;
             };
-            let params = [("ctoken", token.as_str()), ("continuation", token.as_str()), ("type", "next")];
-            response = self.music("browse", json!({ "continuation": token }), &params)?;
+            response = self.more(&token)?;
         }
         Ok(())
+    }
+
+    fn more(&self, token: &str) -> Result<Value, String> {
+        let params = [("ctoken", token), ("continuation", token), ("type", "next")];
+        self.music("browse", json!({ "continuation": token }), &params)
+    }
+
+    pub fn liked(&self) -> Result<Vec<Item>, String> {
+        let mut response = self.music("browse", json!({ "browseId": LIKED_SONGS }), &[])?;
+        let mut token = tracks_continuation(&response);
+        let mut songs = parse_page(&response).songs();
+        for _ in 1..LIKED_PAGES {
+            let Some(next) = token else { break };
+            response = self.more(&next)?;
+            songs.extend(parse_page(&response).songs());
+            token = continuation(&response);
+        }
+        Ok(songs)
+    }
+
+    pub fn rate(&self, video_id: &str, liked: bool) -> Result<(), String> {
+        let endpoint = if liked { "like/like" } else { "like/removelike" };
+        self.music(endpoint, json!({ "target": { "videoId": video_id } }), &[]).map(drop)
     }
 
     pub fn home(&self, seeds: &[Item], emit: &(dyn Fn(usize, Vec<Section>) + Sync)) -> Result<(), String> {
@@ -304,44 +396,66 @@ impl Client {
         Ok(parse_page(&self.music("next", body, &[])?).songs())
     }
 
-    pub fn stream(&self, video_id: &str) -> Result<Stream, String> {
-        let first = self.player(video_id)?;
-        let response = if playable(&first) {
-            first
-        } else {
-            self.visitor.lock().unwrap().clear();
-            self.player(video_id)?
+    pub fn lyrics(&self, video_id: &str) -> Result<Option<Lyrics>, String> {
+        let watch = self.music("next", json!({ "videoId": video_id }), &[])?;
+        let tabs = find(&watch, "tabs").and_then(Value::as_array);
+        let Some(id) = tabs
+            .into_iter()
+            .flatten()
+            .map(|tab| &tab["tabRenderer"])
+            .filter(|tab| tab["unselectable"] != true)
+            .filter_map(|tab| tab.pointer("/endpoint/browseEndpoint/browseId")?.as_str())
+            .find(|id| id.starts_with(LYRICS_TAB))
+        else {
+            return Ok(None);
         };
-        if !playable(&response) {
-            let status = &response["playabilityStatus"];
-            let reason = status["reason"].as_str().or(status["status"].as_str());
-            return Err(reason.unwrap_or("This track cannot be played").to_owned());
+        let body = json!({
+            "context": { "client": { "clientName": LYRICS_CLIENT, "clientVersion": LYRICS_VERSION, "hl": LANGUAGE } },
+            "browseId": id,
+        });
+        let request = self
+            .agent
+            .post(&format!("{MUSIC_API}browse?prettyPrint=false"))
+            .set("User-Agent", LYRICS_UA)
+            .set("X-YouTube-Client-Name", LYRICS_CLIENT_ID)
+            .set("X-YouTube-Client-Version", LYRICS_VERSION);
+        if let Some(timed) = send(request, body).ok().as_ref().and_then(timed_lyrics) {
+            return Ok(Some(timed));
         }
-        let formats = response["streamingData"]["adaptiveFormats"].as_array();
-        let format = formats
-            .and_then(|all| all.iter().find(|f| f["itag"].as_u64() == Some(AAC_ITAG) && f["url"].is_string()))
-            .ok_or("No compatible audio stream for this track")?;
-        let number = |key: &str| format[key].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        Ok(Stream {
-            url: format["url"].as_str().unwrap_or_default().to_owned(),
-            len: number("contentLength"),
-            duration_ms: number("approxDurationMs"),
+        Ok(plain_lyrics(&self.music("browse", json!({ "browseId": id }), &[])?))
+    }
+
+    pub fn stream(&self, video_id: &str) -> Result<Stream, String> {
+        let mut response = self.player(video_id)?;
+        if audio(&response).is_none() {
+            self.visitor.lock().unwrap().clear();
+            response = self.player(video_id)?;
+        }
+        if audio(&response).is_none() && self.refresh_clients() {
+            response = self.player(video_id)?;
+        }
+        audio(&response).ok_or_else(|| {
+            let status = &response["playabilityStatus"];
+            let reason = if playable(&response) {
+                None
+            } else {
+                status["reason"].as_str().or(status["status"].as_str())
+            };
+            reason.unwrap_or("No compatible audio stream for this track").to_owned()
         })
     }
 
     fn player(&self, video_id: &str) -> Result<Value, String> {
         let visitor = self.ensure_visitor()?;
+        let (mut client, id, user_agent) = {
+            let player = &self.clients.lock().unwrap().player;
+            (player.client.clone(), player.id.clone(), player.user_agent.clone())
+        };
+        let version = client["clientVersion"].as_str().unwrap_or_default().to_owned();
+        client["hl"] = LANGUAGE.into();
+        client["visitorData"] = visitor.as_str().into();
         let body = json!({
-            "context": { "client": {
-                "clientName": PLAYER_CLIENT,
-                "clientVersion": PLAYER_VERSION,
-                "deviceMake": "Apple",
-                "deviceModel": PLAYER_DEVICE,
-                "osName": "visionOS",
-                "osVersion": PLAYER_OS,
-                "hl": LANGUAGE,
-                "visitorData": visitor,
-            }},
+            "context": { "client": client },
             "videoId": video_id,
             "contentCheckOk": true,
             "racyCheckOk": true,
@@ -349,11 +463,17 @@ impl Client {
         let request = self
             .agent
             .post(PLAYER_API)
-            .set("User-Agent", PLAYER_UA)
-            .set("X-YouTube-Client-Name", PLAYER_CLIENT_ID)
-            .set("X-YouTube-Client-Version", PLAYER_VERSION)
+            .set("User-Agent", &user_agent)
+            .set("X-YouTube-Client-Name", &id)
+            .set("X-YouTube-Client-Version", &version)
             .set("X-Goog-Visitor-Id", &visitor);
-        send(request, body)
+        match request.send_json(body) {
+            Ok(response) => read(response),
+            Err(ureq::Error::Status(code, _)) => {
+                Ok(json!({ "playabilityStatus": { "reason": format!("YouTube answered with HTTP {code}") } }))
+            }
+            Err(error) => Err(describe(error)),
+        }
     }
 
     fn ensure_visitor(&self) -> Result<String, String> {
@@ -372,13 +492,14 @@ impl Client {
     }
 
     fn music(&self, endpoint: &str, mut body: Value, params: &[(&str, &str)]) -> Result<Value, String> {
-        body["context"] = json!({ "client": { "clientName": "WEB_REMIX", "clientVersion": REMIX_VERSION, "hl": LANGUAGE } });
+        let version = self.clients.lock().unwrap().remix_version.clone();
+        body["context"] = json!({ "client": { "clientName": "WEB_REMIX", "clientVersion": version, "hl": LANGUAGE } });
         let mut request = self
             .agent
             .post(&format!("{MUSIC_API}{endpoint}?prettyPrint=false"))
             .set("Origin", auth::ORIGIN)
             .set("X-YouTube-Client-Name", REMIX_CLIENT_ID)
-            .set("X-YouTube-Client-Version", REMIX_VERSION);
+            .set("X-YouTube-Client-Version", &version);
         for (name, value) in params {
             request = request.query(name, value);
         }
@@ -429,6 +550,34 @@ fn find<'a>(node: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
+fn timed_lyrics(response: &Value) -> Option<Lyrics> {
+    let cues = find(response, "timedLyricsData")?.as_array()?;
+    let lines: Vec<(u64, String)> = cues
+        .iter()
+        .filter_map(|cue| {
+            let start = cue.pointer("/cueRange/startTimeMilliseconds")?.as_str()?.parse().ok()?;
+            Some((start, cue["lyricLine"].as_str()?.to_owned()))
+        })
+        .collect();
+    let source = find(response, "sourceMessage").and_then(Value::as_str).unwrap_or_default();
+    (!lines.is_empty()).then(|| Lyrics {
+        lines,
+        synced: true,
+        source: source.to_owned(),
+    })
+}
+
+fn plain_lyrics(response: &Value) -> Option<Lyrics> {
+    let shelf = find(response, "musicDescriptionShelfRenderer")?;
+    let words = text(&shelf["description"]);
+    let lines: Vec<(u64, String)> = words.lines().map(|line| (0, line.trim().to_owned())).collect();
+    (!lines.is_empty()).then(|| Lyrics {
+        lines,
+        synced: false,
+        source: text(&shelf["footer"]),
+    })
+}
+
 fn single_song_cover(watch_page: &str) -> String {
     let mut mentions = watch_page
         .match_indices(SONG_CARD_KEY)
@@ -452,6 +601,10 @@ fn continuation(response: &Value) -> Option<String> {
     let classic = find(response, "nextContinuationData").map(|data| &data["continuation"]);
     let token = classic.or_else(|| find(response, "continuationCommand").map(|command| &command["token"]))?;
     token.as_str().map(str::to_owned)
+}
+
+fn tracks_continuation(playlist: &Value) -> Option<String> {
+    find(playlist, "musicPlaylistShelfRenderer").and_then(continuation)
 }
 
 struct Lean;
@@ -520,6 +673,19 @@ fn playable(response: &Value) -> bool {
     response["playabilityStatus"]["status"] == "OK"
 }
 
+fn audio(response: &Value) -> Option<Stream> {
+    let formats = response["streamingData"]["adaptiveFormats"]
+        .as_array()
+        .filter(|_| playable(response))?;
+    let format = formats.iter().find(|f| f["itag"].as_u64() == Some(AAC_ITAG))?;
+    let number = |key: &str| format[key].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    Some(Stream {
+        url: format["url"].as_str()?.to_owned(),
+        len: number("contentLength"),
+        duration_ms: number("approxDurationMs"),
+    })
+}
+
 fn describe(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(code, _) => format!("YouTube answered with HTTP {code}"),
@@ -538,6 +704,11 @@ pub fn sized(url: &str, px: u32) -> String {
     } else {
         url.to_owned()
     }
+}
+
+pub fn sharper(url: &str, px: u32) -> Option<String> {
+    let id = url.split_once(VIDEO_FRAME_HOST)?.1.strip_prefix("/vi/")?.split('/').next()?;
+    (px > LISTED_FRAME_SIDE).then(|| format!("https://{VIDEO_FRAME_HOST}/vi/{id}/{SHARP_FRAME}"))
 }
 
 pub fn parse_page(response: &Value) -> Page {
@@ -718,27 +889,35 @@ fn item(node: &Value) -> Option<Item> {
         ),
         ..Item::default()
     };
-    links(node, &mut it);
+    links(node, "", &mut it);
     it.is_artist = !it.is_song() && it.browse_id.starts_with("UC");
     tidy(&mut it);
     (it.is_song() || !it.browse_id.is_empty()).then_some(it)
 }
 
-fn links(node: &Value, it: &mut Item) {
+fn links(node: &Value, run_text: &str, it: &mut Item) {
     match node {
-        Value::Array(list) => list.iter().for_each(|child| links(child, it)),
+        Value::Array(list) => list.iter().for_each(|child| links(child, run_text, it)),
         Value::Object(map) => {
+            let run_text = map.get("text").and_then(Value::as_str).unwrap_or(run_text);
             for (key, child) in map {
                 if key == "browseEndpoint" {
                     let kind = child.pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType");
                     let id = child["browseId"].as_str().unwrap_or_default();
                     match kind.and_then(Value::as_str) {
-                        Some("MUSIC_PAGE_TYPE_ARTIST") if it.artist_id.is_empty() => it.artist_id = id.to_owned(),
+                        Some("MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL") => {
+                            if it.artist_id.is_empty() {
+                                it.artist_id = id.to_owned();
+                            }
+                            if !run_text.is_empty() && it.artists.iter().all(|(_, known)| known != id) {
+                                it.artists.push((run_text.to_owned(), id.to_owned()));
+                            }
+                        }
                         Some("MUSIC_PAGE_TYPE_ALBUM") if it.album_id.is_empty() => it.album_id = id.to_owned(),
                         _ => {}
                     }
                 } else if key != "menu" {
-                    links(child, it);
+                    links(child, run_text, it);
                 }
             }
         }
@@ -803,6 +982,127 @@ mod tests {
             sized("https://i.ytimg.com/vi/x/hq720.jpg?sqp=a&rs=b", 240),
             "https://i.ytimg.com/vi/x/hq720.jpg?sqp=a&rs=b"
         );
+    }
+
+    #[test]
+    fn reads_timed_lyrics_and_falls_back_to_plain_text() {
+        let timed = json!({ "contents": { "timedLyricsModel": { "lyricsData": {
+            "timedLyricsData": [
+                { "lyricLine": "♪", "cueRange": { "startTimeMilliseconds": "0", "endTimeMilliseconds": "14940" } },
+                { "lyricLine": "Our ends were beginnings", "cueRange": { "startTimeMilliseconds": "19180" } },
+                { "lyricLine": "no start time" },
+            ],
+            "sourceMessage": "Source: Musixmatch",
+        } } } });
+        let lyrics = timed_lyrics(&timed).unwrap();
+        assert_eq!(lyrics.lines, [(0, "♪".to_owned()), (19180, "Our ends were beginnings".to_owned())]);
+        assert!(lyrics.synced);
+        assert_eq!(lyrics.source, "Source: Musixmatch");
+        assert_eq!(timed_lyrics(&json!({ "contents": {} })), None);
+
+        let plain = json!({ "musicDescriptionShelfRenderer": {
+            "description": { "runs": [{ "text": "First line\r\n\r\nSecond line" }] },
+            "footer": { "runs": [{ "text": "Source: LyricFind" }] },
+        } });
+        let lyrics = plain_lyrics(&plain).unwrap();
+        let lines: Vec<&str> = lyrics.lines.iter().map(|(_, line)| line.as_str()).collect();
+        assert_eq!(lines, ["First line", "", "Second line"]);
+        assert!(!lyrics.synced);
+        assert_eq!(plain_lyrics(&json!({ "messageRenderer": {} })), None);
+    }
+
+    #[test]
+    fn links_a_video_to_its_uploader_when_it_names_no_artist() {
+        let byline = |kind: &str| {
+            json!({
+                "title": { "runs": [{ "text": "Get Lucky (10 min loop)" }] },
+                "videoId": "video",
+                "subtitle": { "runs": [{ "text": "nTOURIST", "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "UCuploader",
+                    "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": { "pageType": kind } },
+                } } }] },
+            })
+        };
+        assert_eq!(item(&byline("MUSIC_PAGE_TYPE_USER_CHANNEL")).unwrap().artist_id, "UCuploader");
+        assert_eq!(item(&byline("MUSIC_PAGE_TYPE_ARTIST")).unwrap().artist_id, "UCuploader");
+        assert_eq!(item(&byline("MUSIC_PAGE_TYPE_PLAYLIST")).unwrap().artist_id, "");
+    }
+
+    #[test]
+    fn keeps_every_artist_of_a_song_with_its_own_page() {
+        let artist = |name: &str, id: &str| {
+            json!({ "text": name, "navigationEndpoint": { "browseEndpoint": {
+                "browseId": id,
+                "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" } },
+            } } })
+        };
+        let runs = json!([artist("ERAY067", "UC1"), { "text": ", " }, artist("MANSUR", "UC2"), { "text": " & " }, artist("Yung Ouzo", "UC3"), { "text": " • " }, { "text": "1.8M plays" }]);
+        let song = item(&json!({
+            "title": { "runs": [{ "text": "olm was rap mep" }] },
+            "videoId": "song",
+            "subtitle": { "runs": runs },
+            "shortBylineText": { "runs": [artist("ERAY067", "UC1")] },
+        }))
+        .unwrap();
+        let pair = |name: &str, id: &str| (name.to_owned(), id.to_owned());
+        assert_eq!(song.subtitle, "ERAY067, MANSUR & Yung Ouzo • 1.8M plays");
+        assert_eq!(
+            song.artists,
+            [pair("ERAY067", "UC1"), pair("MANSUR", "UC2"), pair("Yung Ouzo", "UC3")]
+        );
+        assert_eq!(song.artist_id, "UC1");
+    }
+
+    #[test]
+    fn pages_through_a_playlist_by_its_own_token_not_the_suggestions_one() {
+        let track = |id: &str| json!({ "musicResponsiveListItemRenderer": { "title": { "runs": [{ "text": id }] }, "videoId": id } });
+        let first = json!({ "sectionListRenderer": {
+            "continuations": [{ "nextContinuationData": { "continuation": "suggestions" } }],
+            "contents": [{ "musicPlaylistShelfRenderer": { "contents": [
+                track("a"),
+                { "continuationItemRenderer": { "continuationEndpoint": { "continuationCommand": { "token": "tracks" } } } },
+            ] } }],
+        } });
+        assert_eq!(continuation(&first).as_deref(), Some("suggestions"));
+        assert_eq!(tracks_continuation(&first).as_deref(), Some("tracks"));
+
+        let last = json!({ "onResponseReceivedActions": [{ "appendContinuationItemsAction": {
+            "continuationItems": [track("b"), track("c")],
+        } }] });
+        let songs: Vec<String> = parse_page(&last).songs().into_iter().map(|song| song.video_id).collect();
+        assert_eq!(songs, ["b", "c"]);
+        assert_eq!(continuation(&last), None);
+    }
+
+    #[test]
+    fn queues_a_song_once_when_it_also_has_a_video() {
+        let watch = r#"{ "contents": [{ "playlistPanelVideoWrapperRenderer": {
+            "primaryRenderer": { "playlistPanelVideoRenderer": {
+                "title": { "runs": [{ "text": "RANDEVU" }] }, "videoId": "song"
+            } },
+            "counterpart": [{ "counterpartRenderer": { "playlistPanelVideoRenderer": {
+                "title": { "runs": [{ "text": "MOTIVE - RANDEVU (Official Music Video)" }] }, "videoId": "video"
+            } } }]
+        } }] }"#;
+        let response = Lean.deserialize(&mut serde_json::Deserializer::from_str(watch)).unwrap();
+        let queued: Vec<String> = parse_page(&response).songs().into_iter().map(|song| song.video_id).collect();
+        assert_eq!(queued, ["song"]);
+    }
+
+    #[test]
+    fn asks_for_a_sharper_video_frame_only_at_large_sizes() {
+        let frame = "https://i.ytimg.com/vi/x/hqdefault.jpg?sqp=a&rs=b";
+        assert_eq!(sharper(frame, 512).as_deref(), Some("https://i.ytimg.com/vi/x/maxresdefault.jpg"));
+        assert_eq!(sharper(frame, 256), None);
+        assert_eq!(sharper("https://lh3.googleusercontent.com/abc=w60-h60-l90-rj", 512), None);
+    }
+
+    #[test]
+    fn accepts_only_a_complete_client_list() {
+        assert!(Clients::parse(BUNDLED_CLIENTS).is_some());
+        assert!(Clients::parse("{}").is_none());
+        assert!(Clients::parse(&BUNDLED_CLIENTS.replace("\"clientName\"", "\"name\"")).is_none());
+        assert!(Clients::parse(&BUNDLED_CLIENTS.replace("\"101\"", "\"\"")).is_none());
     }
 
     #[test]
