@@ -100,7 +100,7 @@ fn system_font(file: &str) -> Option<&'static [u8]> {
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    let embedded: [(&str, &'static [u8]); 8] = [
+    let embedded: [(&str, &'static [u8]); 9] = [
         ("onest-400", include_bytes!("../assets/fonts/onest-latin-400.ttf")),
         ("onest-400-ext", include_bytes!("../assets/fonts/onest-latin-ext-400.ttf")),
         ("onest-500", include_bytes!("../assets/fonts/onest-latin-500.ttf")),
@@ -115,6 +115,7 @@ pub fn install(ctx: &egui::Context) {
             "shoulders-800-ext",
             include_bytes!("../assets/fonts/big-shoulders-display-latin-ext-800.ttf"),
         ),
+        ("unifont", include_bytes!("../assets/fonts/unifont-16.0.04.ttf")),
     ];
     for (name, bytes) in embedded {
         fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
@@ -140,6 +141,54 @@ pub fn install(ctx: &egui::Context) {
             fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
         }
     }
+
+    // NOTE: system font discovery is handled below by enumerating font dirs;
+    // the previous targeted-candidates block is redundant and removed.
+    // Discover and register many system fonts from common font directories so
+    // egui can fallback to them for wide Unicode coverage.
+    let mut system_font_keys: Vec<String> = Vec::new();
+    {
+        use std::ffi::OsStr;
+        use std::path::Path;
+        let font_dirs = [
+            "/usr/share/fonts",
+            "/usr/local/share/fonts",
+            &format!("{}/.local/share/fonts", std::env::var("HOME").unwrap_or_default()),
+        ];
+        for d in &font_dirs {
+            let dir = Path::new(d);
+            if !dir.exists() {
+                continue;
+            }
+            let mut stack_dirs = vec![dir.to_path_buf()];
+            while let Some(p) = stack_dirs.pop() {
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            stack_dirs.push(path);
+                            continue;
+                        }
+                        if let Some(ext) = path.extension().and_then(OsStr::to_str) {
+                            let ext = ext.to_ascii_lowercase();
+                            if ext == "ttf" || ext == "otf" || ext == "ttc" {
+                                if let Ok(bytes) = std::fs::read(&path) {
+                                    if let Some(stem) = path.file_stem().and_then(OsStr::to_str) {
+                                        let key = format!("sys-{}", stem.replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+                                        if !fonts.font_data.contains_key(&key) {
+                                            fonts.font_data.insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+                                            system_font_keys.push(key);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let known = fonts.font_data.clone();
     let stack = |own: [&str; 2], system: &str| -> Vec<String> {
         let fallbacks = [
@@ -154,10 +203,18 @@ pub fn install(ctx: &egui::Context) {
             "symbols",
             "Ubuntu-Light",
         ];
-        own.into_iter()
-            .chain(fallbacks)
-            .filter(|name| known.contains_key(*name))
-            .map(str::to_owned)
+        // Build an ordered chain including embedded names, configured fallbacks,
+        // and discovered system font keys.
+        let mut chain_iter: Vec<String> = own.into_iter().map(|s| s.to_owned()).collect();
+        for f in &fallbacks {
+            chain_iter.push(f.to_string());
+        }
+        chain_iter.extend(system_font_keys.iter().cloned());
+        // Ensure unifont is used as the very last fallback
+        chain_iter.push("unifont".to_string());
+        chain_iter
+            .into_iter()
+            .filter(|name| known.contains_key(name.as_str()))
             .collect()
     };
     fonts
