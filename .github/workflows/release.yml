@@ -60,3 +60,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create ${{ github.ref_name }} tubefast-windows-x64.zip tubefast.exe tubefast.json SHA256SUMS.txt --title "Tubefast ${{ github.ref_name }}" --generate-notes
+
+  macos:
+    needs: windows
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.90 --profile minimal --target aarch64-apple-darwin --target x86_64-apple-darwin
+          rustup default 1.90
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          lipo -create -output tubefast target/aarch64-apple-darwin/release/tubefast target/x86_64-apple-darwin/release/tubefast
+          macos/bundle.sh tubefast .
+          ditto -c -k --keepParent Tubefast.app tubefast-macos-universal.zip
+          gh release download ${{ github.ref_name }} --pattern SHA256SUMS.txt
+          shasum -a 256 tubefast-macos-universal.zip >> SHA256SUMS.txt
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: tubefast-macos-universal.zip
+      - name: Publish
+        run: gh release upload ${{ github.ref_name }} tubefast-macos-universal.zip SHA256SUMS.txt --clobber
