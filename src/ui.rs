@@ -142,8 +142,6 @@ pub fn install(ctx: &egui::Context) {
         }
     }
 
-    // NOTE: system font discovery is handled below by enumerating font dirs;
-    // the previous targeted-candidates block is redundant and removed.
     // Discover and register many system fonts from common font directories so
     // egui can fallback to them for wide Unicode coverage.
     let mut system_font_keys: Vec<String> = Vec::new();
@@ -162,27 +160,38 @@ pub fn install(ctx: &egui::Context) {
             }
             let mut stack_dirs = vec![dir.to_path_buf()];
             while let Some(p) = stack_dirs.pop() {
-                if let Ok(entries) = std::fs::read_dir(&p) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            stack_dirs.push(path);
-                            continue;
-                        }
-                        if let Some(ext) = path.extension().and_then(OsStr::to_str) {
-                            let ext = ext.to_ascii_lowercase();
-                            if ext == "ttf" || ext == "otf" || ext == "ttc" {
-                                if let Ok(bytes) = std::fs::read(&path) {
-                                    if let Some(stem) = path.file_stem().and_then(OsStr::to_str) {
-                                        let key = format!("sys-{}", stem.replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
-                                        if !fonts.font_data.contains_key(&key) {
-                                            fonts.font_data.insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
-                                            system_font_keys.push(key);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                let Ok(entries) = std::fs::read_dir(&p) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack_dirs.push(path);
+                        continue;
+                    }
+
+                    // Filter by font file extensions
+                    let Some(ext) = path.extension().and_then(OsStr::to_str) else {
+                        continue;
+                    };
+                    let ext = ext.to_ascii_lowercase();
+                    if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+                        continue;
+                    }
+
+                    // Extract file stem and build font key
+                    let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+                        continue;
+                    };
+                    let key = format!("sys-{}", stem.replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+                    if fonts.font_data.contains_key(&key) {
+                        continue;
+                    }
+
+                    // Read file and insert font data
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        fonts.font_data.insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
+                        system_font_keys.push(key);
                     }
                 }
             }
@@ -212,10 +221,7 @@ pub fn install(ctx: &egui::Context) {
         chain_iter.extend(system_font_keys.iter().cloned());
         // Ensure unifont is used as the very last fallback
         chain_iter.push("unifont".to_string());
-        chain_iter
-            .into_iter()
-            .filter(|name| known.contains_key(name.as_str()))
-            .collect()
+        chain_iter.into_iter().filter(|name| known.contains_key(name.as_str())).collect()
     };
     fonts
         .families
