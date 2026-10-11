@@ -707,9 +707,7 @@ impl App {
             }
         }
         if self.yt.take_expired() {
-            auth::forget();
-            self.saved.leave_account();
-            self.library.clear();
+            self.sign_out();
             self.notify("Your YouTube session ended. Sign in again.");
         }
         self.player.follow_default_device();
